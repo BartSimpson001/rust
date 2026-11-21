@@ -18,7 +18,7 @@ declare_tool_lint! {
     /// span), `help` or `note`.
     ///
     /// These usages of `span_lint_and_then` should be replaced with one of the
-    /// wrapper functions `span_lint_and_sugg`, span_lint_and_help`, or
+    /// wrapper functions `span_lint_and_sugg`, `span_lint_and_help`, or
     /// `span_lint_and_note`.
     ///
     /// ### Why is this bad?
@@ -68,7 +68,7 @@ declare_tool_lint! {
     pub clippy::COLLAPSIBLE_SPAN_LINT_CALLS,
     Warn,
     "found collapsible `span_lint_and_then` calls",
-    report_in_external_macro: true
+    @report_in_external_macro = true
 }
 
 declare_lint_pass!(CollapsibleCalls => [COLLAPSIBLE_SPAN_LINT_CALLS]);

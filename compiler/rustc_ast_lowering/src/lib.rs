@@ -47,7 +47,7 @@ use rustc_ast::visit::{self, Visitor};
 use rustc_ast::{self as ast, *};
 use rustc_attr_ir::find_attr;
 use rustc_attr_ir::lang_items::LangItem;
-use rustc_attr_ir::target::Target;
+use rustc_attr_ir::target::AstTarget;
 use rustc_attr_parsing::{AttributeParser, Recovery, ShouldEmit};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::sorted_map::SortedMap;
@@ -56,7 +56,7 @@ use rustc_data_structures::steal::Steal;
 use rustc_data_structures::tagged_ptr::TaggedRef;
 use rustc_errors::codes::*;
 use rustc_errors::{DiagArgFromDisplay, DiagCtxtHandle, ErrorGuaranteed};
-use rustc_hir::def::{DefKind, Namespace, PerNS, Res};
+use rustc_hir::def::{CtorKind, DefKind, Namespace, PerNS, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId, LocalDefIdMap};
 use rustc_hir::definitions::PerParentDisambiguatorState;
 use rustc_hir::lints::DelayedLint;
@@ -182,6 +182,7 @@ struct PerOwnerLoweringState<'a, 'hir> {
     // -- Transient --
     impl_trait_defs: Vec<hir::GenericParam<'hir>>,
     impl_trait_bounds: Vec<hir::WherePredicate<'hir>>,
+    const_defs: Vec<hir::GenericParam<'hir>>,
 }
 
 impl<'a, 'hir> PerOwnerLoweringState<'a, 'hir> {
@@ -211,6 +212,7 @@ impl<'a, 'hir> PerOwnerLoweringState<'a, 'hir> {
             children: LocalDefIdMap::default(),
             impl_trait_defs: Vec::new(),
             impl_trait_bounds: Vec::new(),
+            const_defs: Vec::new(),
         }
     }
 
@@ -226,6 +228,7 @@ impl<'a, 'hir> PerOwnerLoweringState<'a, 'hir> {
         assert_eq!(self.owner_id(), node.def_id());
         assert!(self.impl_trait_defs.is_empty());
         assert!(self.impl_trait_bounds.is_empty());
+        assert!(self.const_defs.is_empty());
 
         let attrs = self.attrs;
         let mut bodies = self.bodies;
@@ -443,22 +446,53 @@ impl<'tcx> ResolverAstLowering<'tcx> {
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug)]
+    struct AllowedRelaxedBounds: u32 {
+        const SIZED = 1 << 0;
+        const FORGET = 1 << 1;
+        // any other relaxed bound, see `#[feature(more_maybe_bounds)]`
+        const OTHER = 1 << 31;
+    }
+}
+
 /// How relaxed bounds `?Trait` should be treated.
 ///
 /// Relaxed bounds should only be allowed in places where we later
 /// (namely during HIR ty lowering) perform *sized elaboration*.
 #[derive(Debug)]
-enum RelaxedBoundPolicy<'a> {
+struct RelaxedBoundPolicy<'a> {
     /// The `DefId` refers to the trait that is being relaxed.
-    Allowed(&'a mut FxIndexMap<DefId, Span>),
-    Forbidden(RelaxedBoundForbiddenReason),
+    dedup: &'a mut FxIndexMap<DefId, Span>,
+    reason: Option<RelaxedBoundForbiddenReason>,
+    allowed_bounds: AllowedRelaxedBounds,
 }
-impl RelaxedBoundPolicy<'_> {
+
+impl<'a> RelaxedBoundPolicy<'a> {
+    fn allow_all(dedup: &'a mut FxIndexMap<DefId, Span>) -> Self {
+        Self { dedup, reason: None, allowed_bounds: AllowedRelaxedBounds::all() }
+    }
+
+    fn forbidden(
+        dedup: &'a mut FxIndexMap<DefId, Span>,
+        reason: RelaxedBoundForbiddenReason,
+    ) -> Self {
+        Self { dedup, reason: Some(reason), allowed_bounds: AllowedRelaxedBounds::empty() }
+    }
+
+    // FIXME(forget_trait) this will become used when Forget is added.
+    #[expect(unused)]
+    fn allow_some(
+        dedup: &'a mut FxIndexMap<DefId, Span>,
+        reason: RelaxedBoundForbiddenReason,
+        allowed_bounds: AllowedRelaxedBounds,
+    ) -> Self {
+        Self { dedup, reason: Some(reason), allowed_bounds }
+    }
+
     fn reborrow(&mut self) -> RelaxedBoundPolicy<'_> {
-        match self {
-            RelaxedBoundPolicy::Allowed(m) => RelaxedBoundPolicy::Allowed(m),
-            RelaxedBoundPolicy::Forbidden(reason) => RelaxedBoundPolicy::Forbidden(*reason),
-        }
+        let &mut Self { ref mut dedup, reason, allowed_bounds } = self;
+        RelaxedBoundPolicy { dedup, reason, allowed_bounds }
     }
 }
 
@@ -587,7 +621,7 @@ enum TryBlockScope {
 fn index_ast<'tcx>(
     tcx: TyCtxt<'tcx>,
     (): (),
-) -> &'tcx IndexSlice<LocalDefId, Steal<(Arc<ResolverAstLowering<'tcx>>, AstOwner)>> {
+) -> &'tcx IndexSlice<LocalDefId, Option<Steal<(Arc<ResolverAstLowering<'tcx>>, AstOwner)>>> {
     // Queries that borrow `resolver_for_lowering`.
     tcx.ensure_done().output_filenames(());
     tcx.ensure_done().early_lint_checks(());
@@ -610,20 +644,19 @@ fn index_ast<'tcx>(
     let index = indexer.index;
     let resolver = Arc::new(resolver);
     return tcx.arena.alloc_index_slice_from_iter::<LocalDefId, _, _>(
-        index.into_iter().map(|owner| Steal::new((Arc::clone(&resolver), owner))),
+        index.into_iter().map(|owner| owner.map(|o| Steal::new((Arc::clone(&resolver), o)))),
     );
 
     struct Indexer<'s, 'hir> {
         owners: &'s NodeMap<PerOwnerResolverData<'hir>>,
-        index: IndexVec<LocalDefId, AstOwner>,
+        index: IndexVec<LocalDefId, Option<AstOwner>>,
         next_node_id: NodeId,
     }
 
     impl Indexer<'_, '_> {
         fn insert(&mut self, id: NodeId, node: AstOwner) {
             let def_id = self.owners[&id].def_id;
-            self.index.ensure_contains_elem(def_id, || AstOwner::NonOwner);
-            self.index[def_id] = node;
+            self.index.insert(def_id, node);
         }
 
         fn make_dummy<K>(
@@ -705,7 +738,7 @@ fn lower_to_hir(tcx: TyCtxt<'_>, def_id: LocalDefId) -> hir::MaybeOwner<'_> {
     tcx.ensure_done().resolve_type_relative_delegations(());
 
     let ast_index = tcx.index_ast(());
-    let resolver_and_node = ast_index.get(def_id).map(Steal::steal);
+    let resolver_and_node = ast_index.get(def_id);
 
     let fallback_to_ancestor = || {
         // The item did not exist in the AST, it was created while lowering another item.
@@ -732,10 +765,13 @@ fn lower_to_hir(tcx: TyCtxt<'_>, def_id: LocalDefId) -> hir::MaybeOwner<'_> {
         })
     };
 
-    let Some((resolver, node)) = resolver_and_node else {
+    let Some(Some(r_and_node)) = resolver_and_node else {
         // `ast_index` does not contain all definitions, only up-to the highest
         // `LocalDefId` which has a non-trivial `AstOwner`. Gracefully handle
         // other definitions, in particular those nested inside this highest definition.
+        // OR
+        // The item existed in the AST, but is not a HIR owner.
+        // Fetch the correct information from its parent.
         return fallback_to_ancestor();
     };
 
@@ -750,12 +786,14 @@ fn lower_to_hir(tcx: TyCtxt<'_>, def_id: LocalDefId) -> hir::MaybeOwner<'_> {
         hir::MaybeOwner::Owner(lctx.curr_owner.into_owner_info(tcx, item))
     }
 
+    let (resolver, node) = r_and_node.steal();
+
     let item = match &node {
         // The item existed in the AST.
         AstOwner::Crate(c) => with_lctx(tcx, &*resolver, CRATE_NODE_ID, |lctx| {
             debug_assert_eq!(lctx.curr_owner.owner_id(), CRATE_OWNER_ID);
             let module = lctx.lower_mod(&c.items, &c.spans);
-            lctx.lower_attrs(hir::CRATE_HIR_ID, &c.attrs, c.spans.inner_span, Target::Crate);
+            lctx.lower_attrs(hir::CRATE_HIR_ID, &c.attrs, c.spans.inner_span, AstTarget::Crate(c));
             hir::OwnerNode::Crate(module)
         }),
         AstOwner::Item(item) => {
@@ -770,9 +808,6 @@ fn lower_to_hir(tcx: TyCtxt<'_>, def_id: LocalDefId) -> hir::MaybeOwner<'_> {
         AstOwner::ForeignItem(item) => with_lctx(tcx, &*resolver, item.id, |lctx| {
             hir::OwnerNode::ForeignItem(lctx.lower_foreign_item(item))
         }),
-        // The item existed in the AST, but is not a HIR owner.
-        // Fetch the correct information from its parent.
-        AstOwner::NonOwner => fallback_to_ancestor(),
     };
 
     tcx.sess.time("drop_ast", || mem::drop(node));
@@ -805,6 +840,14 @@ enum GenericArgsMode {
     Err,
     /// Silence errors when lowering generics. Only used with `Res::Err`.
     Silence,
+}
+
+#[derive(Debug, Copy, Clone)]
+enum DiscardParams {
+    /// Should be used for functions without a body. Lowers the attributes on the parameter and then discards them.
+    Yes,
+    /// Should be used for functions with a body. Does not lower the attributes, as lowering of the parameters is done by `lower_body`.
+    No,
 }
 
 impl<'hir> LoweringContext<'_, 'hir> {
@@ -1136,9 +1179,9 @@ impl<'hir> LoweringContext<'_, 'hir> {
         id: HirId,
         attrs: &[Attribute],
         target_span: Span,
-        target: Target,
+        ast_target: AstTarget<'_>,
     ) -> &'hir [rustc_attr_ir::Attribute] {
-        self.lower_attrs_with_extra(id, attrs, target_span, target, None, &[])
+        self.lower_attrs_with_extra(id, attrs, target_span, ast_target, &[])
     }
 
     fn lower_attrs_with_extra(
@@ -1146,15 +1189,14 @@ impl<'hir> LoweringContext<'_, 'hir> {
         id: HirId,
         attrs: &[Attribute],
         target_span: Span,
-        target: Target,
-        target_item: Option<&ast::Item>,
+        ast_target: AstTarget<'_>,
         extra_hir_attributes: &[rustc_attr_ir::Attribute],
     ) -> &'hir [rustc_attr_ir::Attribute] {
         if attrs.is_empty() && extra_hir_attributes.is_empty() {
             &[]
         } else {
             let mut lowered_attrs =
-                self.lower_attrs_vec(attrs, self.lower_span(target_span), id, target, target_item);
+                self.lower_attrs_vec(attrs, self.lower_span(target_span), id, ast_target);
             lowered_attrs.extend(extra_hir_attributes.iter().cloned());
 
             assert_eq!(id.owner, self.curr_owner.owner_id());
@@ -1180,15 +1222,13 @@ impl<'hir> LoweringContext<'_, 'hir> {
         attrs: &[Attribute],
         target_span: Span,
         target_hir_id: HirId,
-        target: Target,
-        target_item: Option<&ast::Item>,
+        ast_target: AstTarget<'_>,
     ) -> Vec<rustc_attr_ir::Attribute> {
         let l = self.span_lowerer();
         self.attribute_parser.parse_attribute_list(
             attrs,
             target_span,
-            target,
-            target_item,
+            ast_target,
             |s| l.lower(s),
             |lint_id, span, kind| {
                 self.curr_owner.delayed_lints.push(DelayedLint {
@@ -1271,7 +1311,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                             args: Default::default(),
                             constraints: &[],
                             parenthesized: hir::GenericArgsParentheses::ReturnTypeNotation,
-                            span: data.span,
+                            span: constraint.ident.span.to(data.span),
                         }
                     } else {
                         let guar = self.emit_bad_parenthesized_trait_in_assoc_ty(data);
@@ -1311,7 +1351,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                                 .gen_args
                                 .as_ref()
                                 .map_or(constraint.ident.span, |args| args.span());
-                            if bound_end_span.eq_ctxt(constraint.span) {
+                            if bound_end_span.ctxt() == constraint.span.ctxt() {
                                 Some(self.tcx.sess.source_map().next_point(bound_end_span))
                             } else {
                                 None
@@ -1330,7 +1370,10 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 } else {
                     let bounds = self.lower_param_bounds(
                         bounds,
-                        RelaxedBoundPolicy::Forbidden(RelaxedBoundForbiddenReason::AssocTyBounds),
+                        RelaxedBoundPolicy::forbidden(
+                            &mut Default::default(),
+                            RelaxedBoundForbiddenReason::AssocTyBounds,
+                        ),
                         itctx,
                     );
                     hir::AssocItemConstraintKind::Bound { bounds }
@@ -1420,10 +1463,10 @@ impl<'hir> LoweringContext<'_, 'hir> {
                         let ct = self.arena.alloc(ct);
                         return GenericArg::Const(ct.try_as_ambig_ct().unwrap());
                     }
-                    TyKind::GcaMacro(expr) if self.tcx.features().gca_min_const_items() => {
+                    TyKind::GcaMacro(expr) if self.tcx.features().gca() => {
                         let ct = match self.can_lower_expr_to_const_arg_direct(
                             expr,
-                            DirectConstArgContext::MacrolessMinGenericConstArgs,
+                            self.direct_const_arg_context_enabled_by_gca_macro(),
                         ) {
                             Ok(()) => self.lower_expr_to_const_arg_direct(expr, None),
                             Err(e) => e.emit(self),
@@ -1487,7 +1530,10 @@ impl<'hir> LoweringContext<'_, 'hir> {
                         span: t.span,
                         parens: ast::Parens::No,
                     },
-                    RelaxedBoundPolicy::Forbidden(RelaxedBoundForbiddenReason::TraitObjectTy),
+                    RelaxedBoundPolicy::forbidden(
+                        &mut Default::default(),
+                        RelaxedBoundForbiddenReason::TraitObjectTy,
+                    ),
                     itctx,
                 );
                 let bounds = this.arena.alloc_from_iter([bound]);
@@ -1527,14 +1573,14 @@ impl<'hir> LoweringContext<'_, 'hir> {
             TyKind::Infer => hir::TyKind::Infer(()),
             TyKind::Err(guar) => hir::TyKind::Err(*guar),
             TyKind::Slice(ty) => hir::TyKind::Slice(self.lower_ty_alloc(ty, itctx)),
-            TyKind::Ptr(mt) => hir::TyKind::Ptr(self.lower_mt(mt, itctx)),
-            TyKind::Ref(region, mt) => {
+            TyKind::Ptr(ty, mutbl) => hir::TyKind::Ptr(self.lower_ty_alloc(ty, itctx), *mutbl),
+            TyKind::Ref(region, ty, mutbl) => {
                 let lifetime = self.lower_ty_direct_lifetime(t, *region);
-                hir::TyKind::Ref(lifetime, self.lower_mt(mt, itctx))
+                hir::TyKind::Ref(lifetime, self.lower_ty_alloc(ty, itctx), *mutbl)
             }
-            TyKind::PinnedRef(region, mt) => {
+            TyKind::PinnedRef(region, ty, mutbl) => {
                 let lifetime = self.lower_ty_direct_lifetime(t, *region);
-                let kind = hir::TyKind::Ref(lifetime, self.lower_mt(mt, itctx));
+                let kind = hir::TyKind::Ref(lifetime, self.lower_ty_alloc(ty, itctx), *mutbl);
                 let span = self.lower_span(t.span);
                 let arg = hir::Ty { kind, span, hir_id: self.next_id() };
                 let args = self.arena.alloc(hir::GenericArgs {
@@ -1547,14 +1593,23 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 hir::TyKind::Path(path)
             }
             TyKind::FnPtr(f) => {
+                let hir_id = self.lower_node_id(t.id);
                 let generic_params = self.lower_lifetime_binder(t.id, &f.generic_params);
-                hir::TyKind::FnPtr(self.arena.alloc(hir::FnPtrTy {
+                let kind = hir::TyKind::FnPtr(self.arena.alloc(hir::FnPtrTy {
                     generic_params,
                     safety: self.lower_safety(f.safety, hir::Safety::Safe),
                     abi: self.lower_extern(f.ext),
-                    decl: self.lower_fn_decl(&f.decl, t.id, FnDeclKind::Pointer, None),
+                    decl: self.lower_fn_decl(
+                        &f.decl,
+                        t.id,
+                        hir_id,
+                        FnDeclKind::Pointer,
+                        None,
+                        DiscardParams::Yes,
+                    ),
                     param_idents: self.lower_fn_params_to_idents(&f.decl),
-                }))
+                }));
+                return hir::Ty { kind, span: self.lower_span(t.span), hir_id };
             }
             TyKind::UnsafeBinder(f) => {
                 let generic_params = self.lower_lifetime_binder(t.id, &f.generic_params);
@@ -1605,7 +1660,8 @@ impl<'hir> LoweringContext<'_, 'hir> {
                             GenericBound::Trait(ty) => {
                                 let trait_ref = this.lower_poly_trait_ref(
                                     ty,
-                                    RelaxedBoundPolicy::Forbidden(
+                                    RelaxedBoundPolicy::forbidden(
+                                        &mut Default::default(),
                                         RelaxedBoundForbiddenReason::TraitObjectTy,
                                     ),
                                     itctx,
@@ -1665,7 +1721,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     ImplTraitContext::InBinding => {
                         hir::TyKind::TraitAscription(self.lower_param_bounds(
                             bounds,
-                            RelaxedBoundPolicy::Allowed(&mut Default::default()),
+                            RelaxedBoundPolicy::allow_all(&mut Default::default()),
                             itctx,
                         ))
                     }
@@ -1827,7 +1883,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
         self.lower_opaque_inner(opaque_ty_node_id, origin, opaque_ty_span, |this| {
             this.lower_param_bounds(
                 bounds,
-                RelaxedBoundPolicy::Allowed(&mut Default::default()),
+                RelaxedBoundPolicy::allow_all(&mut Default::default()),
                 itctx,
             )
         })
@@ -1882,36 +1938,46 @@ impl<'hir> LoweringContext<'_, 'hir> {
     }
 
     fn lower_fn_params_to_idents(&mut self, decl: &FnDecl) -> &'hir [Option<Ident>] {
-        self.arena.alloc_from_iter(decl.inputs.iter().map(|param| match param.pat.kind {
-            PatKind::Missing => None,
-            PatKind::Ident(_, ident, _) => Some(self.lower_ident(ident)),
-            PatKind::Wild => Some(Ident::new(kw::Underscore, self.lower_span(param.pat.span))),
-            _ => {
-                self.dcx().span_delayed_bug(
-                    param.pat.span,
-                    "non-missing/ident/wild param pat must trigger an error",
-                );
-                None
-            }
-        }))
+        self.arena.alloc_from_iter(decl.inputs.iter().filter(|param| !param.is_const_param()).map(
+            |param| match param.pat.kind {
+                PatKind::Missing => None,
+                PatKind::Ident(_, ident, _) => Some(self.lower_ident(ident)),
+                PatKind::Wild => Some(Ident::new(kw::Underscore, self.lower_span(param.pat.span))),
+                _ => {
+                    self.dcx().span_delayed_bug(
+                        param.pat.span,
+                        "non-missing/ident/wild param pat must trigger an error",
+                    );
+                    None
+                }
+            },
+        ))
     }
 
     /// Lowers a function declaration.
     ///
     /// `decl`: the unlowered (AST) function declaration.
     ///
-    /// `fn_node_id`: `impl Trait` arguments are lowered into generic parameters on the given
-    /// `NodeId`.
+    /// `fn_node_id`: Node Id of the function.
     ///
-    /// `transform_return_type`: if `Some`, applies some conversion to the return type, such as is
-    /// needed for `async fn` and `gen fn`. See [`CoroutineKind`] for more details.
+    /// `fn_hir_id`: Hir Id of the function. Used for attribute parsing.
+    ///
+    /// `kind`: The kind of function.
+    ///
+    /// `coro`: If the function is a coroutine, information about the coroutine.
+    ///
+    /// `discard_params`: if `DiscardParams::Yes`, the parameters are lowered and then discarded. Set this to `DiscardParams::Yes`
+    /// for functions without bodies, as attributes on parameters are otherwise not validated.
+    /// Set this to `DiscardParams::No` for functions with bodies, as lowering of the parameters is done by `lower_body`.
     #[instrument(level = "debug", skip(self))]
     fn lower_fn_decl(
         &mut self,
         decl: &FnDecl,
         fn_node_id: NodeId,
+        fn_hir_id: HirId,
         kind: FnDeclKind,
         coro: Option<CoroutineMarker>,
+        discard_params: DiscardParams,
     ) -> &'hir hir::FnDecl<'hir> {
         let c_variadic = decl.c_variadic();
         let mut splatted = decl.splatted();
@@ -1919,13 +1985,77 @@ impl<'hir> LoweringContext<'_, 'hir> {
         // Skip the `...` (`CVarArgs`) trailing arguments from the AST,
         // as they are not explicit in HIR/Ty function signatures.
         // (instead, the `c_variadic` flag is set to `true`)
-        let mut inputs = &decl.inputs[..];
-        if decl.c_variadic() {
+        let input_count = if decl.c_variadic() {
             // Splat + variadic errors in AST validation, so just ignore one of them here.
             splatted = None;
-            inputs = &inputs[..inputs.len() - 1];
-        }
-        let inputs = self.arena.alloc_from_iter(inputs.iter().map(|param| {
+            decl.inputs.len() - 1
+        } else {
+            decl.inputs.len()
+        };
+
+        let inputs = decl.inputs.iter().enumerate().take(input_count);
+        // Function argument const params are moved from `inputs` into the function's
+        // generics. Their position is taken from the original `decl.inputs` (before
+        // removing `...`), so it matches the argument position at the call site.
+        let inputs = self.arena.alloc_from_iter(inputs.filter_map(|(param_idx, param)| {
+            if let Some(ident) = param.const_param_ident() {
+                if !matches!(
+                    kind,
+                    FnDeclKind::Fn | FnDeclKind::Inherent | FnDeclKind::Impl | FnDeclKind::Trait
+                ) {
+                    self.dcx().span_delayed_bug(
+                        param.span,
+                        "Const args only allowed for Free/Inherent/Impl/Trait methods",
+                    );
+                    return None;
+                }
+                let ty = self.lower_ty_alloc(
+                    &param.ty,
+                    ImplTraitContext::Disallowed(ImplTraitPosition::GenericDefault),
+                );
+                let hir_id = self.lower_node_id(param.id);
+                let generic_param = hir::GenericParam {
+                    hir_id,
+                    def_id: self.local_def_id(param.id),
+                    name: ParamName::Plain(self.lower_ident(ident)),
+                    span: self.lower_span(param.span),
+                    pure_wrt_drop: false,
+                    kind: hir::GenericParamKind::Const {
+                        ty,
+                        default: None,
+                        arg_pos: Some(param_idx as u16),
+                    },
+                    colon_span: None,
+                    source: hir::GenericParamSource::Generics,
+                };
+                let ast_generic_param = ast::GenericParam {
+                    id: param.id,
+                    ident,
+                    attrs: param.attrs.clone(),
+                    bounds: Default::default(),
+                    is_placeholder: false,
+                    kind: ast::GenericParamKind::Const {
+                        ty: param.ty.clone(),
+                        span: param.span,
+                        default: None,
+                    },
+                    colon_span: None,
+                };
+                self.lower_attrs(
+                    hir_id,
+                    &param.attrs,
+                    param.span,
+                    AstTarget::GenericParam(&ast_generic_param),
+                );
+                self.curr_owner.const_defs.push(generic_param);
+                return None;
+            }
+            if let DiscardParams::Yes = discard_params {
+                // FIXME This uses `fn_hir_id`, which is not correct, it should use the parameter hir id instead
+                // The parameter is currently not lowered for functions without bodies, so there is no place to store the lowered hir id
+                // This should be fixed by storing function parameters in the `hir::FnSig` instead of `hir::Body`
+                self.lower_attrs(fn_hir_id, &param.attrs, param.span, AstTarget::Param(param));
+            }
             let itctx = match kind {
                 FnDeclKind::Fn | FnDeclKind::Inherent | FnDeclKind::Impl | FnDeclKind::Trait => {
                     ImplTraitContext::Universal
@@ -1940,7 +2070,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     ImplTraitContext::Disallowed(ImplTraitPosition::PointerParam)
                 }
             };
-            self.lower_ty(&param.ty, itctx)
+            Some(self.lower_ty(&param.ty, itctx))
         }));
 
         let output = match coro {
@@ -1998,10 +2128,10 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     // Given we are only considering `ImplicitSelf` types, we needn't consider
                     // the case where we have a mutable pattern to a reference as that would
                     // no longer be an `ImplicitSelf`.
-                    TyKind::Ref(_, mt) | TyKind::PinnedRef(_, mt)
-                        if mt.ty.kind.is_implicit_self() =>
+                    TyKind::Ref(_, ty, mutbl) | TyKind::PinnedRef(_, ty, mutbl)
+                        if ty.kind.is_implicit_self() =>
                     {
-                        match mt.mutbl {
+                        match mutbl {
                             hir::Mutability::Not => hir::ImplicitSelfKind::RefImm,
                             hir::Mutability::Mut => hir::ImplicitSelfKind::RefMut,
                         }
@@ -2241,7 +2371,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
         let hir_id = self.lower_node_id(param.id);
         let param_attrs = &param.attrs;
         let param_span = param.span();
-        let param = hir::GenericParam {
+        let param_hir = hir::GenericParam {
             hir_id,
             def_id: self.local_def_id(param.id),
             name,
@@ -2251,8 +2381,8 @@ impl<'hir> LoweringContext<'_, 'hir> {
             colon_span: param.colon_span.map(|s| self.lower_span(s)),
             source,
         };
-        self.lower_attrs(hir_id, param_attrs, param_span, Target::from(&param));
-        param
+        self.lower_attrs(hir_id, param_attrs, param_span, AstTarget::GenericParam(param));
+        param_hir
     }
 
     fn lower_generic_param_kind(
@@ -2336,7 +2466,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
 
                 (
                     hir::ParamName::Plain(self.lower_ident(param.ident)),
-                    hir::GenericParamKind::Const { ty, default },
+                    hir::GenericParamKind::Const { ty, default, arg_pos: None },
                 )
             }
         }
@@ -2393,88 +2523,81 @@ impl<'hir> LoweringContext<'_, 'hir> {
         span: Span,
         rbp: RelaxedBoundPolicy<'_>,
     ) {
-        // Even though feature `more_maybe_bounds` enables the user to relax all default bounds
-        // other than `Sized` in a lot more positions (thereby bypassing the given policy), we don't
-        // want to advertise it to the user (via a feature gate error) since it's super internal.
-        //
-        // FIXME(more_maybe_bounds): Moreover, if we actually were to add proper default traits
-        // (like a hypothetical `Move` or `Leak`) we would want to validate the location according
-        // to default trait elaboration in HIR ty lowering (which depends on the specific trait in
-        // question: E.g., `?Sized` & `?Move` most likely won't be allowed in all the same places).
+        let tcx = self.tcx;
 
-        match rbp {
-            RelaxedBoundPolicy::Allowed(dedup_map) => {
-                // `trait_def_id` only returns `None` for errors during resolution.
-                let Some(trait_def_id) = trait_ref.trait_def_id() else { return };
-                let tcx = self.tcx;
-                let err = |s| {
-                    let name = tcx.item_name(trait_def_id);
-                    tcx.dcx()
-                        .struct_span_err(
-                            vec![span, s],
-                            format!("duplicate relaxed `{name}` bounds"),
+        let deny = |trait_name: Option<&str>| {
+            let (context, subject) = match rbp.reason {
+                Some(RelaxedBoundForbiddenReason::TraitObjectTy) => {
+                    ("trait object types", "trait object types")
+                }
+                Some(RelaxedBoundForbiddenReason::SuperTrait) => ("supertrait bounds", "traits"),
+                Some(RelaxedBoundForbiddenReason::TraitAlias) => {
+                    ("trait alias bounds", "trait aliases")
+                }
+                Some(RelaxedBoundForbiddenReason::AssocTyBounds)
+                | Some(RelaxedBoundForbiddenReason::WhereBound)
+                | None => {
+                    self.dcx()
+                        .struct_span_err(span, "this relaxed bound is not permitted here")
+                        .with_note(
+                            "in this context, relaxed bounds are only allowed on \
+                             type parameters defined on the closest item",
                         )
-                        .with_code(E0203)
                         .emit();
-                };
-                dedup_map.entry(trait_def_id).and_modify(|&mut s| err(s)).or_insert(span);
-                return;
+                    return;
+                }
+            };
+
+            let mut diag = self.dcx().struct_span_err(
+                span,
+                format!(
+                    "relaxed {}bounds are not permitted in {context}",
+                    trait_name.map(|i| format!("`{i}` ")).unwrap_or_default()
+                ),
+            );
+            if let Some(name) = trait_name {
+                diag.note(format!(
+                    "{subject} are not implicitly bounded by `{name}`, \
+                     so there is nothing to relax"
+                ));
             }
-            RelaxedBoundPolicy::Forbidden(reason) => {
-                let gate = |context, subject| {
-                    let extended = self.tcx.features().more_maybe_bounds();
-                    let is_sized = trait_ref
-                        .trait_def_id()
-                        .is_some_and(|def_id| self.tcx.is_lang_item(def_id, LangItem::Sized));
+            diag.emit();
+        };
 
-                    if extended && !is_sized {
-                        return;
-                    }
+        // `trait_def_id` only returns `None` for errors during resolution,
+        // and there's no need to re-report those.
+        let Some(trait_def_id) = trait_ref.trait_def_id() else { return };
 
-                    let prefix = if extended { "`Sized` " } else { "" };
-                    let mut diag = self.dcx().struct_span_err(
-                        span,
-                        format!("relaxed {prefix}bounds are not permitted in {context}"),
-                    );
-                    if is_sized {
-                        diag.note(format!(
-                            "{subject} are not implicitly bounded by `Sized`, \
-                             so there is nothing to relax"
-                        ));
-                    }
-                    diag.emit();
-                };
-
-                match reason {
-                    RelaxedBoundForbiddenReason::TraitObjectTy => {
-                        gate("trait object types", "trait object types");
-                        return;
-                    }
-                    RelaxedBoundForbiddenReason::SuperTrait => {
-                        gate("supertrait bounds", "traits");
-                        return;
-                    }
-                    RelaxedBoundForbiddenReason::TraitAlias => {
-                        gate("trait alias bounds", "trait aliases");
-                        return;
-                    }
-                    RelaxedBoundForbiddenReason::AssocTyBounds
-                    | RelaxedBoundForbiddenReason::WhereBound => {}
-                };
+        if self.tcx.is_lang_item(trait_def_id, LangItem::Sized) {
+            if !rbp.allowed_bounds.contains(AllowedRelaxedBounds::SIZED) {
+                return deny(Some("Sized"));
+            }
+        } else if self.tcx.features().more_maybe_bounds()
+            && !rbp.allowed_bounds.contains(AllowedRelaxedBounds::OTHER)
+        {
+            // Even though feature `more_maybe_bounds` enables the user to relax all default bounds
+            // other than `Sized` in a lot more positions (thereby bypassing the given policy), we don't
+            // want to advertise it to the user (via a feature gate error) since it's super internal.
+            match rbp.reason {
+                Some(RelaxedBoundForbiddenReason::TraitObjectTy)
+                | Some(RelaxedBoundForbiddenReason::SuperTrait)
+                | Some(RelaxedBoundForbiddenReason::TraitAlias)
+                | None => {
+                    return;
+                }
+                Some(RelaxedBoundForbiddenReason::AssocTyBounds)
+                | Some(RelaxedBoundForbiddenReason::WhereBound) => return deny(None),
             }
         }
 
-        self.dcx()
-            .struct_span_err(span, "this relaxed bound is not permitted here")
-            .with_note(
-                "in this context, relaxed bounds are only allowed on \
-                 type parameters defined on the closest item",
-            )
-            .emit();
-    }
-
-    fn lower_mt(&mut self, mt: &MutTy, itctx: ImplTraitContext) -> hir::MutTy<'hir> {
-        hir::MutTy { ty: self.lower_ty_alloc(&mt.ty, itctx), mutbl: mt.mutbl }
+        let err = |s| {
+            let name = tcx.item_name(trait_def_id);
+            tcx.dcx()
+                .struct_span_err(vec![span, s], format!("duplicate relaxed `{name}` bounds"))
+                .with_code(E0203)
+                .emit();
+        };
+        rbp.dedup.entry(trait_def_id).and_modify(|&mut s| err(s)).or_insert(span);
     }
 
     #[instrument(level = "debug", skip(self), ret)]
@@ -2527,7 +2650,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
             bounds,
             /* colon_span */ None,
             span,
-            RelaxedBoundPolicy::Allowed(&mut Default::default()),
+            RelaxedBoundPolicy::allow_all(&mut Default::default()),
             ImplTraitContext::Universal,
             hir::PredicateOrigin::ImplTrait,
         );
@@ -2632,18 +2755,12 @@ impl<'hir> LoweringContext<'_, 'hir> {
         span: Span,
     ) -> hir::ConstItemRhs<'hir> {
         let is_direct = |body| {
-            if self.tcx.features().gca_macroless_items() {
-                self.can_lower_expr_to_const_arg_direct(
-                    body,
-                    DirectConstArgContext::MacrolessMinGenericConstArgs,
-                )
-                .is_ok()
+            let context = if self.tcx.features().gca_macroless_items() {
+                self.direct_const_arg_context_enabled_by_gca_macro()
             } else {
-                // do not check can_lower_expr_to_const_arg_direct, but rather just
-                // ExprKind::GcaMacro, because we don't want e.g.
-                // `impl<const N: u8> { const C: u8 = N; }` to be a direct-rhs const
-                matches!(body, Expr { kind: ExprKind::GcaMacro(_), .. })
-            }
+                DirectConstArgContext::GCA_MACRO
+            };
+            self.can_lower_expr_to_const_arg_direct(body, context).is_ok()
         };
         if self.tcx.features().gca_min_const_items()
             && let Some(body) = body
@@ -2657,13 +2774,25 @@ impl<'hir> LoweringContext<'_, 'hir> {
         }
     }
 
+    fn direct_const_arg_context_enabled_by_gca_macro(&self) -> DirectConstArgContext {
+        let mut result = DirectConstArgContext::GCA_BASE_FEATURES;
+        if self.tcx.features().gca_min_const_items() {
+            result |= DirectConstArgContext::GCA_MIN_CONST_ITEMS;
+        }
+        if self.tcx.features().gca_adts() {
+            result |= DirectConstArgContext::GCA_ADTS;
+        }
+        result
+    }
+
+    /// Only valid for const *arg* contexts, not const *item* contexts.
     fn ambient_direct_const_arg_context(&self) -> DirectConstArgContext {
         if self.tcx.features().gca_macroless_args() {
-            DirectConstArgContext::MacrolessMinGenericConstArgs
-        } else if self.tcx.features().gca_min_const_items() {
-            DirectConstArgContext::MinGenericConstArgs
+            self.direct_const_arg_context_enabled_by_gca_macro()
+        } else if self.tcx.features().gca() {
+            DirectConstArgContext::GCA
         } else {
-            DirectConstArgContext::Stable
+            DirectConstArgContext::STABLE
         }
     }
 
@@ -2675,9 +2804,16 @@ impl<'hir> LoweringContext<'_, 'hir> {
         res: Option<Res<NodeId>>,
         context: DirectConstArgContext,
     ) -> Result<(), UnrepresentableConstArgError> {
-        if let DirectConstArgContext::MacrolessMinGenericConstArgs = context {
+        if context.contains(DirectConstArgContext::PATH_ANY) {
             Ok(())
-        } else if qself.is_none()
+        } else if context.contains(DirectConstArgContext::PATH_CONST_CTOR)
+            && matches!(res, Some(Res::Def(DefKind::Ctor(_, CtorKind::Const), _)))
+        {
+            // FIXME(gca_adts): This check is incomplete. Type-relative paths and other complicating
+            // factors make things very difficult - e.g. `<Option<T>>::None`
+            Ok(())
+        } else if context.contains(DirectConstArgContext::PATH_PLAIN_PARAM)
+            && qself.is_none()
             && path.is_single_argless_ident()
             && matches!(res, Some(Res::Def(DefKind::ConstParam, _)))
         {
@@ -2693,59 +2829,61 @@ impl<'hir> LoweringContext<'_, 'hir> {
         expr: &Expr,
         context: DirectConstArgContext,
     ) -> Result<(), UnrepresentableConstArgError> {
-        use DirectConstArgContext::*;
         // Note the only stable case is currently ExprKind::Path
-        match (&expr.kind, context) {
-            (
-                ExprKind::Call(Expr { kind: ExprKind::Path(_, _), .. }, args),
-                MacrolessMinGenericConstArgs,
-            ) => {
+        match &expr.kind {
+            ExprKind::Call(Expr { kind: ExprKind::Path(_, _), .. }, args)
+                if context.contains(DirectConstArgContext::TUPLE_CALL) =>
+            {
                 for arg in args {
                     self.can_lower_expr_to_const_arg_direct(arg, context)?;
                 }
                 Ok(())
             }
-            (ExprKind::Tup(exprs), MacrolessMinGenericConstArgs) => {
+            ExprKind::Tup(exprs) if context.contains(DirectConstArgContext::TUPLE) => {
                 for expr in exprs {
                     self.can_lower_expr_to_const_arg_direct(expr, context)?;
                 }
                 Ok(())
             }
-            (ExprKind::Path(qself, path), _) => {
+            ExprKind::Path(qself, path) => {
                 let res =
                     self.get_partial_res(expr.id).and_then(|partial_res| partial_res.full_res());
                 self.can_lower_path_to_const_arg_direct(qself, path, expr.span, res, context)
             }
-            (ExprKind::Struct(se), MacrolessMinGenericConstArgs) => {
+            ExprKind::Struct(se) if context.contains(DirectConstArgContext::STRUCT) => {
                 for f in &se.fields {
                     self.can_lower_expr_to_const_arg_direct(&f.expr, context)?;
                 }
                 Ok(())
             }
-            (ExprKind::Array(elements), MacrolessMinGenericConstArgs) => {
+            ExprKind::Array(elements) if context.contains(DirectConstArgContext::ARRAY) => {
                 for element in elements {
                     self.can_lower_expr_to_const_arg_direct(element, context)?;
                 }
                 Ok(())
             }
-            (ExprKind::Underscore, MacrolessMinGenericConstArgs) => Ok(()),
-            (ExprKind::Paren(expr), MacrolessMinGenericConstArgs) => {
+            ExprKind::Underscore if context.contains(DirectConstArgContext::UNDERSCORE) => Ok(()),
+            ExprKind::Paren(expr) if context.contains(DirectConstArgContext::PAREN) => {
                 self.can_lower_expr_to_const_arg_direct(expr, context)
             }
-            (ExprKind::Block(block, _), MacrolessMinGenericConstArgs)
-                if let [stmt] = block.stmts.as_slice()
+            ExprKind::Block(block, _)
+                if context.contains(DirectConstArgContext::BLOCK)
+                    && let [stmt] = block.stmts.as_slice()
                     && let StmtKind::Expr(expr) = &stmt.kind =>
             {
                 self.can_lower_expr_to_const_arg_direct(expr, context)
             }
-            (ExprKind::Lit(_), MacrolessMinGenericConstArgs) => Ok(()),
-            (ExprKind::Unary(UnOp::Neg, inner_expr), MacrolessMinGenericConstArgs)
-                if let ExprKind::Lit(_) = &inner_expr.kind =>
+            ExprKind::Lit(_) if context.contains(DirectConstArgContext::LIT) => Ok(()),
+            ExprKind::Unary(UnOp::Neg, inner_expr)
+                if context.contains(DirectConstArgContext::LIT)
+                    && let ExprKind::Lit(_) = &inner_expr.kind =>
             {
                 Ok(())
             }
-            (ExprKind::ConstBlock(_), MacrolessMinGenericConstArgs) => Ok(()),
-            (ExprKind::GcaMacro(_), MacrolessMinGenericConstArgs | MinGenericConstArgs) => {
+            ExprKind::ConstBlock(_) if context.contains(DirectConstArgContext::CONST_BLOCK) => {
+                Ok(())
+            }
+            ExprKind::GcaMacro(_) if context.contains(DirectConstArgContext::GCA_MACRO) => {
                 // Always report this as able to be represented directly. If it turns out not to be,
                 // `lower_expr_to_const_arg_direct` will report an error.
                 Ok(())
@@ -2801,10 +2939,9 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     None,
                 );
 
-                let lowered_args = self.arena.alloc_from_iter(args.iter().map(|arg| {
-                    let const_arg = self.lower_expr_to_const_arg_direct(arg, None);
-                    &*self.arena.alloc(const_arg)
-                }));
+                let lowered_args = self.arena.alloc_from_iter(
+                    args.iter().map(|arg| self.lower_expr_to_const_arg_direct(arg, None)),
+                );
 
                 ConstArg {
                     hir_id: self.lower_node_id(node_id),
@@ -2813,10 +2950,9 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 }
             }
             ExprKind::Tup(exprs) => {
-                let exprs = self.arena.alloc_from_iter(exprs.iter().map(|expr| {
-                    let expr = self.lower_expr_to_const_arg_direct(expr, None);
-                    &*self.arena.alloc(expr)
-                }));
+                let exprs = self.arena.alloc_from_iter(
+                    exprs.iter().map(|expr| self.lower_expr_to_const_arg_direct(expr, None)),
+                );
 
                 ConstArg {
                     hir_id: self.lower_node_id(node_id),
@@ -2846,15 +2982,15 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     // FIXME(mgca): This might result in lowering attributes that
                     // then go unused as the `Target::ExprField` is not actually
                     // corresponding to `Node::ExprField`.
-                    self.lower_attrs(hir_id, &f.attrs, f.span, Target::ExprField);
+                    self.lower_attrs(hir_id, &f.attrs, f.span, AstTarget::ExprField(f));
                     let expr = self.lower_expr_to_const_arg_direct(&f.expr, None);
 
-                    &*self.arena.alloc(hir::ConstArgExprField {
+                    hir::ConstArgExprField {
                         hir_id,
                         field: self.lower_ident(f.ident),
                         expr: self.arena.alloc(expr),
                         span: self.lower_span(f.span),
-                    })
+                    }
                 }));
 
                 ConstArg {
@@ -2864,10 +3000,11 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 }
             }
             ExprKind::Array(elements) => {
-                let lowered_elems = self.arena.alloc_from_iter(elements.iter().map(|element| {
-                    let const_arg = self.lower_expr_to_const_arg_direct(element, None);
-                    &*self.arena.alloc(const_arg)
-                }));
+                let lowered_elems = self.arena.alloc_from_iter(
+                    elements
+                        .iter()
+                        .map(|element| self.lower_expr_to_const_arg_direct(element, None)),
+                );
                 let array_expr = self.arena.alloc(hir::ConstArgArrayExpr {
                     span: self.lower_span(expr.span),
                     elems: lowered_elems,
@@ -2931,11 +3068,9 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 // `can_lower_expr_to_const_arg_direct` always returns success upon encountering a
                 // ExprKind::GcaMacro, which effectively forces the expression to be lowered as a
                 // direct arg. If it actually turns out to not be possible, emit an error instead.
-                // Always use MacrolessMinGenericConstArgs, even if we're under regular GCA, because
-                // that's what the macro means: to enter a context that is like macroless GCA.
                 match self.can_lower_expr_to_const_arg_direct(
                     expr,
-                    DirectConstArgContext::MacrolessMinGenericConstArgs,
+                    self.direct_const_arg_context_enabled_by_gca_macro(),
                 ) {
                     Ok(()) => self.lower_expr_to_const_arg_direct(expr, id_override),
                     Err(err) => err.emit(self),
@@ -3277,19 +3412,53 @@ impl<'hir> GenericArgsCtor<'hir> {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-enum DirectConstArgContext {
+bitflags::bitflags! {
+    #[derive(Copy, Clone, Debug)]
+    struct DirectConstArgContext: u16 {
+        const TUPLE_CALL = 1 << 0;
+        const TUPLE = 1 << 1;
+        const PATH_PLAIN_PARAM = 1 << 2;
+        const PATH_CONST_CTOR = 1 << 3;
+        const PATH_ANY = 1 << 4;
+        const STRUCT = 1 << 5;
+        const ARRAY = 1 << 6;
+        const UNDERSCORE = 1 << 7;
+        const PAREN = 1 << 8;
+        const BLOCK = 1 << 9;
+        const LIT = 1 << 10;
+        const CONST_BLOCK = 1 << 11;
+        const GCA_MACRO = 1 << 12;
+    }
+}
+
+impl DirectConstArgContext {
     /// The only allowed direct const arg representation is simple paths that nameres to generic
     /// const parameters.
-    Stable,
+    const STABLE: DirectConstArgContext = Self::PATH_PLAIN_PARAM;
+
     /// The allowed representations are what is allowed on stable, plus the `gca!` macro.
-    MinGenericConstArgs,
-    /// Expressions attempt to be lowered directly, and if that fails, the expression falls back to
-    /// being represented as an anon const.
+    const GCA: DirectConstArgContext = Self::STABLE.union(Self::GCA_MACRO);
+
+    /// These expressions are allowed inside the `gca!` macro, regardless of what feature is
+    /// enabling the base `gca!` functionality.
     ///
-    /// This context is also used under MinGenericConstArgs inside a `gca!` macro, for
-    /// simplicity, as they allow the same code.
-    MacrolessMinGenericConstArgs,
+    /// These are also allowed under macroless features without a `gca!` macro.
+    const GCA_BASE_FEATURES: DirectConstArgContext = Self::GCA
+        .union(DirectConstArgContext::UNDERSCORE)
+        .union(DirectConstArgContext::PAREN)
+        .union(DirectConstArgContext::BLOCK)
+        .union(DirectConstArgContext::LIT)
+        .union(DirectConstArgContext::CONST_BLOCK);
+
+    /// These are allowed under `#![feature(gca_min_const_items)]`
+    const GCA_MIN_CONST_ITEMS: DirectConstArgContext = DirectConstArgContext::PATH_ANY;
+
+    /// These are allowed under `#![feature(gca_adts)]`
+    const GCA_ADTS: DirectConstArgContext = DirectConstArgContext::PATH_CONST_CTOR
+        .union(DirectConstArgContext::TUPLE_CALL)
+        .union(DirectConstArgContext::TUPLE)
+        .union(DirectConstArgContext::STRUCT)
+        .union(DirectConstArgContext::ARRAY);
 }
 
 #[derive(Debug)]
@@ -3320,7 +3489,7 @@ impl UnrepresentableConstArgError {
         ConstArg {
             hir_id: lowering_context.next_id(),
             kind: hir::ConstArgKind::Error(e),
-            span: self.span,
+            span: lowering_context.lower_span(self.span),
         }
     }
 }

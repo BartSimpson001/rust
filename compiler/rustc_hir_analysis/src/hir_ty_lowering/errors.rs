@@ -205,10 +205,10 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
 
         let wider_candidate_names: Vec<_> = visible_traits
             .iter()
-            .flat_map(|trait_def_id| tcx.associated_items(*trait_def_id).in_definition_order())
-            .filter_map(|item| {
-                (!item.is_impl_trait_in_trait() && item.tag() == assoc_tag).then(|| item.name())
+            .flat_map(|trait_def_id| {
+                tcx.associated_items(*trait_def_id).named_items_in_definition_order()
             })
+            .filter_map(|item| (item.tag() == assoc_tag).then(|| item.name()))
             .collect();
 
         if let Some(suggested_name) =
@@ -265,7 +265,8 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                         return self.dcx().emit_err(err);
                     }
 
-                    let trait_args = &ty::GenericArgs::identity_for_item(tcx, best_trait)[1..];
+                    let trait_args = ty::GenericArgs::identity_for_item(tcx, best_trait);
+                    let trait_args = &trait_args.as_slice()[1..];
                     let mut trait_ref = trait_name.clone();
                     let applicability = if let [arg, args @ ..] = trait_args {
                         use std::fmt::Write;
@@ -370,7 +371,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
             && let Some(hir_ty) = constraint.ty()
             && let ty = self.lower_ty(hir_ty)
             && (ty.is_enum() || ty.references_error())
-            && tcx.features().gca_min_const_items()
+            && tcx.features().gca()
         {
             Some(diagnostics::AssocKindMismatchWrapInBracesSugg {
                 lo: hir_ty.span.shrink_to_lo(),
@@ -393,14 +394,39 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         } else {
             (ident.span, None, assoc_tag, assoc_item.tag())
         };
+        let mut def_span: MultiSpan = tcx.def_span(assoc_item.def_id).into();
+        def_span.push_span_context(tcx.def_span(tcx.parent(assoc_item.def_id)));
 
+        let def_kind = tcx.def_kind(self.item_def_id());
+        let item_span = tcx.def_span(self.item_def_id()).shrink_to_lo();
+        let (item_span, enclosing_span) = match def_kind {
+            DefKind::AssocConst | DefKind::AssocFn | DefKind::AssocTy => (
+                item_span,
+                Some(tcx.def_span(tcx.parent(self.item_def_id().into())).shrink_to_lo()),
+            ),
+            DefKind::OpaqueTy => {
+                let item_span = tcx.def_span(tcx.parent(self.item_def_id().into())).shrink_to_lo();
+                let enclosing_span =
+                    if let DefKind::AssocConst | DefKind::AssocFn | DefKind::AssocTy =
+                        tcx.def_kind(tcx.parent(self.item_def_id().into()))
+                    {
+                        Some(tcx.def_span(tcx.parent(self.item_def_id().into())).shrink_to_lo())
+                    } else {
+                        None
+                    };
+                (item_span, enclosing_span)
+            }
+            _ => (item_span, None),
+        };
         self.dcx().emit_err(diagnostics::AssocKindMismatch {
             span,
+            item_span,
+            enclosing_span,
             expected: assoc_tag_str(expected),
             got: assoc_tag_str(got),
             expected_because_label,
             assoc_kind: assoc_tag_str(assoc_item.tag()),
-            def_span: tcx.def_span(assoc_item.def_id),
+            def_span,
             bound_on_assoc_const_label,
             wrap_in_braces_sugg,
         })

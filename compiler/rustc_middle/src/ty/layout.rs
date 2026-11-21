@@ -16,12 +16,12 @@ use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span, Spanned, Symbol, bug, span_bug
 use rustc_structures::Limit;
 use rustc_target::callconv::FnAbi;
 use rustc_target::spec::{HasTargetSpec, HasX86AbiOpt, Target, X86Abi};
+use rustc_type_ir::Const;
 use tracing::debug;
 
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::query::TyCtxtAt;
 use crate::traits::ObligationCause;
-use crate::ty::consts::ConstExt;
 use crate::ty::normalize_erasing_regions::NormalizationError;
 use crate::ty::{self, CoroutineArgsExt, Ty, TyCtxt, TypeVisitableExt, Unnormalized};
 
@@ -141,11 +141,21 @@ impl abi::Float {
             F16B => Ty::new_adt(
                 tcx,
                 tcx.adt_def(tcx.require_lang_item(LangItem::F16B, DUMMY_SP)),
-                ty::List::empty(),
+                ty::GenericArgs::empty(),
             ),
             F32 => tcx.types.f32,
             F64 => tcx.types.f64,
+            X87F80 => Ty::new_adt(
+                tcx,
+                tcx.adt_def(tcx.require_lang_item(LangItem::X87F80Raw, DUMMY_SP)),
+                ty::GenericArgs::empty(),
+            ),
             F128 => tcx.types.f128,
+            PpcF128 => Ty::new_adt(
+                tcx,
+                tcx.adt_def(tcx.require_lang_item(LangItem::PpcF128, DUMMY_SP)),
+                ty::GenericArgs::empty(),
+            ),
         }
     }
 
@@ -214,7 +224,7 @@ pub enum ValidityRequirement {
 }
 
 impl ValidityRequirement {
-    pub fn from_intrinsic(intrinsic: Symbol) -> Option<Self> {
+    pub fn from_rustc_intrinsic(intrinsic: Symbol) -> Option<Self> {
         match intrinsic {
             sym::assert_inhabited => Some(Self::Inhabited),
             sym::assert_zero_valid => Some(Self::Zero),
@@ -324,11 +334,20 @@ impl<'tcx> LayoutCx<'tcx> {
 /// While this is conservative, (aside from constant sizes, only pointers,
 /// newtypes thereof and null pointer optimized enums are allowed), it is
 /// enough to statically check common use cases of transmute.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub enum SizeSkeleton<'tcx> {
     /// Any statically computable Layout.
     /// Alignment can be `None` if unknown.
     Known(Size, Option<Align>),
+
+    /// An array with unevaluated const lengths.
+    Array {
+        /// The base size, including the element size and all known array
+        /// lengths accumulated.
+        base: Size,
+        align: Option<Align>,
+        const_lens: Vec<Const<TyCtxt<'tcx>>>,
+    },
 
     /// A potentially-wide pointer.
     Pointer {
@@ -383,7 +402,7 @@ impl<'tcx> SizeSkeleton<'tcx> {
         let err = match tcx.layout_of(typing_env.as_query_input(ty)) {
             Ok(layout) => {
                 if layout.is_sized() {
-                    return Ok(SizeSkeleton::Known(layout.size, Some(layout.align.abi)));
+                    return Ok(SizeSkeleton::Known(layout.size, Some(layout.align)));
                 } else {
                     // Just to be safe, don't claim a known layout for unsized types.
                     return Err(tcx.arena.alloc(LayoutError::Unknown(ty)));
@@ -462,9 +481,25 @@ impl<'tcx> SizeSkeleton<'tcx> {
                                 .checked_mul(c)
                                 .ok_or_else(|| &*tcx.arena.alloc(LayoutError::SizeOverflow(ty)))?;
                             // Alignment is unchanged by arrays.
-                            return Ok(SizeSkeleton::Known(Size::from_bytes(size), a));
+                            Ok(SizeSkeleton::Known(Size::from_bytes(size), a))
+                        } else if s.bytes() == 0 {
+                            Ok(SizeSkeleton::Known(s, a))
+                        } else {
+                            Ok(SizeSkeleton::Array { base: s, align: a, const_lens: vec![len] })
                         }
-                        Err(err)
+                    }
+                    SizeSkeleton::Array { mut base, align, mut const_lens } => {
+                        match len_eval {
+                            Some(c) => {
+                                base = Size::from_bytes(base.bytes().checked_mul(c).ok_or_else(
+                                    || &*tcx.arena.alloc(LayoutError::SizeOverflow(ty)),
+                                )?);
+                            }
+                            None => {
+                                const_lens.push(len);
+                            }
+                        }
+                        Ok(SizeSkeleton::Array { base, align, const_lens })
                     }
                     SizeSkeleton::Pointer { .. } => Err(err),
                 }
@@ -528,6 +563,9 @@ impl<'tcx> SizeSkeleton<'tcx> {
                                     return Err(err);
                                 }
                             }
+                            SizeSkeleton::Array { .. } => {
+                                return Err(err);
+                            }
                             SizeSkeleton::Pointer { .. } => {
                                 if ptr.is_some() {
                                     return Err(err);
@@ -581,7 +619,8 @@ impl<'tcx> SizeSkeleton<'tcx> {
                     // But in the case of `!null` patterns we need to note that in the
                     // raw pointer.
                     ty::PatternKind::NotNull => match base? {
-                        SizeSkeleton::Known(..) => base,
+                        known @ SizeSkeleton::Known(..) => Ok(known),
+                        array @ SizeSkeleton::Array { .. } => Ok(array),
                         SizeSkeleton::Pointer { non_zero: _, tail } => {
                             Ok(SizeSkeleton::Pointer { non_zero: true, tail })
                         }
@@ -593,12 +632,16 @@ impl<'tcx> SizeSkeleton<'tcx> {
         }
     }
 
-    pub fn same_size(self, other: SizeSkeleton<'tcx>) -> bool {
+    pub fn same_size(&self, other: &SizeSkeleton<'tcx>) -> bool {
         match (self, other) {
             (SizeSkeleton::Known(a, _), SizeSkeleton::Known(b, _)) => a == b,
             (SizeSkeleton::Pointer { tail: a, .. }, SizeSkeleton::Pointer { tail: b, .. }) => {
                 a == b
             }
+            (
+                SizeSkeleton::Array { base: a, const_lens: al, .. },
+                SizeSkeleton::Array { base: b, const_lens: bl, .. },
+            ) => a == b && al == bl,
             _ => false,
         }
     }
@@ -827,7 +870,7 @@ where
                     ty::Adt(def, _) => def.variant(variant_index).fields.len(),
                     _ => bug!("`ty_and_layout_for_variant` on unexpected type {}", this.ty),
                 };
-                tcx.mk_layout(LayoutData::uninhabited_variant(cx, variant_index, fields))
+                tcx.mk_layout(LayoutData::uninhabited_variant(variant_index, fields))
             }
 
             Variants::Multiple { .. } => {
@@ -1024,6 +1067,9 @@ where
                 | ty::Param(_)
                 | ty::Infer(_)
                 | ty::Error(_) => bug!("TyAndLayout::field: unexpected type `{}`", this.ty),
+
+                // FIXME(scrabsha)
+                ty::View(..) => unimplemented!(),
             }
         }
 
@@ -1061,19 +1107,40 @@ where
             }
             ty::Ref(_, ty, mt) if offset.bytes() == 0 => {
                 tcx.layout_of(typing_env.as_query_input(ty)).ok().map(|layout| {
-                    let kind = match mt {
+                    let kind;
+                    let size;
+
+                    match mt {
                         hir::Mutability::Not => {
                             let frozen = optimize && ty.is_freeze(tcx, typing_env);
-                            PointerKind::SharedRef { frozen }
+                            kind = PointerKind::SharedRef { frozen };
+
+                            // Set the `size` to zero for non-frozen shared references.
+                            //
+                            // `PointeeInfo::size` is defined to allow adding spurious reads.
+                            // Adding spurious reads is only valid for `&Freeze` and `&mut Unpin`
+                            // references, as otherwise the spurious read can invalidate aliasing
+                            // references.
+                            //
+                            // See discussions in
+                            // - https://github.com/rust-lang/unsafe-code-guidelines/issues/381
+                            // - https://github.com/llvm/llvm-project/pull/218413
+                            // - https://discourse.llvm.org/t/interaction-of-noalias-and-dereferenceable/66979
+                            size = layout.size * frozen as _;
                         }
                         hir::Mutability::Mut => {
                             let unpin = optimize
                                 && ty.is_unpin(tcx, typing_env)
                                 && ty.is_unsafe_unpin(tcx, typing_env);
-                            PointerKind::MutableRef { unpin }
+                            kind = PointerKind::MutableRef { unpin };
+
+                            // Set the `size` to zero for non-unpin unique references.
+                            // See the above comment for reasons to do this.
+                            size = layout.size * unpin as _;
                         }
                     };
-                    PointeeInfo { safe: Some(kind), size: layout.size, align: layout.align.abi }
+
+                    PointeeInfo { safe: Some(kind), size, align: layout.align }
                 })
             }
 
@@ -1081,16 +1148,18 @@ where
                 if offset.bytes() == 0
                     && let Some(pointee) = this.ty.boxed_ty() =>
             {
-                tcx.layout_of(typing_env.as_query_input(pointee)).ok().map(|layout| PointeeInfo {
-                    safe: Some(PointerKind::Box {
-                        // Same logic as for mutable references above.
-                        unpin: optimize
-                            && pointee.is_unpin(tcx, typing_env)
-                            && pointee.is_unsafe_unpin(tcx, typing_env),
-                        global: this.ty.is_box_global(tcx),
-                    }),
-                    size: layout.size,
-                    align: layout.align.abi,
+                tcx.layout_of(typing_env.as_query_input(pointee)).ok().map(|layout| {
+                    // Same logic as for mutable references above.
+                    let unpin = optimize
+                        && pointee.is_unpin(tcx, typing_env)
+                        && pointee.is_unsafe_unpin(tcx, typing_env);
+                    let size = layout.size * unpin as _;
+
+                    PointeeInfo {
+                        safe: Some(PointerKind::Box { unpin, global: this.ty.is_box_global(tcx) }),
+                        size,
+                        align: layout.align,
+                    }
                 })
             }
 
@@ -1226,6 +1295,12 @@ where
     fn is_complex_number_lang_item(this: TyAndLayout<'tcx>, cx: &C) -> bool {
         let Some(def) = this.ty.ty_adt_def() else { return false };
         cx.tcx().is_lang_item(def.did(), LangItem::Complex)
+    }
+
+    /// Is this type `core::arch::{x86, x86_64}::x87_f80`?
+    fn is_x87_f80_lang_item(this: TyAndLayout<'tcx>, cx: &C) -> bool {
+        let Some(def) = this.ty.ty_adt_def() else { return false };
+        cx.tcx().is_lang_item(def.did(), LangItem::X87F80)
     }
 
     fn is_scalable_vector(this: TyAndLayout<'tcx>) -> bool {
@@ -1400,6 +1475,7 @@ pub fn codegen_handle_fn_abi_err<'tcx>(
     fn_abi_request: FnAbiRequest<'tcx>,
 ) -> ErrorGuaranteed {
     match err {
+        FnAbiError::Layout(LayoutError::ReferencesError(guar)) => guar,
         FnAbiError::Layout(LayoutError::SizeOverflow(_) | LayoutError::InvalidSimd { .. }) => {
             tcx.dcx().emit_err(Spanned { span, node: err })
         }

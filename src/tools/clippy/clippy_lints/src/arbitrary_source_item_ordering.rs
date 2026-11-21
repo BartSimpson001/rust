@@ -58,13 +58,13 @@ declare_clippy_lint! {
     ///
     /// | Group              | Item Kinds           |
     /// |--------------------|----------------------|
-    /// | `modules`          | "mod", "foreign_mod" |
-    /// | `use`              | "use"                |
-    /// | `macros`           | "macro"              |
-    /// | `global_asm`       | "global_asm"         |
-    /// | `UPPER_SNAKE_CASE` | "static", "const"    |
-    /// | `PascalCase`       | "ty_alias", "opaque_ty", "enum", "struct", "union", "trait", "trait_alias", "impl" |
-    /// | `lower_snake_case` | "fn"                 |
+    /// | `modules`          | `mod`, `foreign_mod` |
+    /// | `use`              | `use`                |
+    /// | `macros`           | `macro`              |
+    /// | `global_asm`       | `global_asm`         |
+    /// | `UPPER_SNAKE_CASE` | `static`, `const`    |
+    /// | `PascalCase`       | `ty_alias`, `opaque_ty`, `enum`, `struct`, `union`, `trait`, `trait_alias`, `impl` |
+    /// | `lower_snake_case` | `fn`                 |
     ///
     /// The groups' names are arbitrary and can be changed to suit the
     /// conventions that should be enforced for a specific project.
@@ -695,7 +695,7 @@ fn get_trait_item_order(cx: &LateContext<'_>, trait_impl: &rustc_hir::Impl<'_>) 
             cx.tcx
                 .associated_items(def_id)
                 .in_definition_order()
-                .map(rustc_middle::ty::AssocItem::name)
+                .filter_map(rustc_middle::ty::AssocItem::opt_name)
                 .collect()
         })
 }

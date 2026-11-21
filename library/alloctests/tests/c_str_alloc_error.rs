@@ -3,7 +3,7 @@
 //! rust-lang/rust#70201 gave `<CStr as ToOwned>::clone_into` a path that moved the
 //! target `CString`'s buffer out before growing a `Vec`; if that growth's allocation
 //! failed and unwound, the target was left without its nul terminator. This only
-//! reproduces under Miri: in a normal build the `#[global_allocator]` below can't
+//! reproduces under Miri: in a normal build, the `#[global_allocator]` below can't
 //! intercept the reallocation inside `CString::clone_into` (it lives in libstd, which
 //! library tests link with `-C prefer-dynamic`), so as a regular test it just checks
 //! the happy path.
@@ -15,20 +15,22 @@
 #![feature(alloc_error_hook)]
 
 use std::alloc::{GlobalAlloc, Layout, System, set_alloc_error_hook};
+use std::cell::Cell;
 use std::ffi::CString;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // Once armed, the first allocation of 8 bytes or more fails and disarms, so the
 // reallocation inside `clone_into`'s grow path fails while the runtime's own
 // smaller allocations keep succeeding.
 struct OneShotFailingAlloc;
 
-static ARMED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+}
 
 unsafe impl GlobalAlloc for OneShotFailingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if layout.size() >= 8 && ARMED.swap(false, Ordering::SeqCst) {
+        if layout.size() >= 8 && ARMED.replace(false) {
             return core::ptr::null_mut();
         }
         unsafe { System.alloc(layout) }
@@ -39,13 +41,15 @@ unsafe impl GlobalAlloc for OneShotFailingAlloc {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if new_size >= 8 && ARMED.swap(false, Ordering::SeqCst) {
+        if new_size >= 8 && ARMED.replace(false) {
             return core::ptr::null_mut();
         }
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
 
+// This doesn't actually do anything outside Miri because of `-C prefer-dynamic` which effectively
+// hard-codes the default allocator.
 #[global_allocator]
 static ALLOC: OneShotFailingAlloc = OneShotFailingAlloc;
 
@@ -57,11 +61,11 @@ fn clone_into_alloc_failure_leaves_target_valid() {
     let src = CString::new("a fairly long value").unwrap();
     let mut target = CString::new("x").unwrap();
 
-    ARMED.store(true, Ordering::SeqCst);
+    ARMED.set(true);
     // Under Miri the failing allocator is honored, so this reallocation unwinds; in a
     // normal build the allocator can't intercept it and `clone_into` just succeeds.
     let res = catch_unwind(AssertUnwindSafe(|| src.as_c_str().clone_into(&mut target)));
-    ARMED.store(false, Ordering::SeqCst);
+    ARMED.set(false);
 
     if cfg!(miri) {
         assert!(res.is_err(), "clone_into should have unwound on the alloc failure");

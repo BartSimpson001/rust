@@ -1,12 +1,12 @@
 error: the lint `TEST_LINT_DEFAULT` has the default lint description
-  --> tests/ui-internal/default_lint.rs:17:1
+  --> tests/ui-internal/default_lint.rs:18:1
    |
 LL | / declare_tool_lint! {
 LL | |
 LL | |     pub clippy::TEST_LINT_DEFAULT,
 LL | |     Warn,
 LL | |     "default lint description",
-LL | |     report_in_external_macro: true
+LL | |     @report_in_external_macro = true
 LL | | }
    | |_^
    |

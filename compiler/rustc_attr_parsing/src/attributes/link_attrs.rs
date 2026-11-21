@@ -1,6 +1,6 @@
 use rustc_abi::ExternAbi;
-use rustc_ast::ItemKind;
 use rustc_attr_ir::AttributeKind::{LinkName, LinkOrdinal, LinkSection};
+use rustc_attr_ir::target::AstTarget;
 use rustc_attr_ir::*;
 use rustc_errors::msg;
 use rustc_feature::{AttributeStability, Features};
@@ -32,6 +32,7 @@ impl SingleAttributeParser for LinkNameParser {
     const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowListWarnRest(&[
         Allow(Target::ForeignFn),
         Allow(Target::ForeignStatic),
+        Error(Target::Param),
     ]);
     const TEMPLATE: AttributeTemplate = template!(
         NameValueStr: "name",
@@ -74,7 +75,7 @@ impl CombineAttributeParser for LinkParser {
             r#"name = "...", kind = "dylib|static|...", wasm_import_module = "...", import_name_type = "decorated|noprefix|undecorated""#,
         ], "https://doc.rust-lang.org/reference/items/external-blocks.html#the-link-attribute");
     const ALLOWED_TARGETS: AllowedTargets<'_> =
-        AllowedTargets::AllowListWarnRest(&[Allow(Target::ForeignMod)]);
+        AllowedTargets::AllowListWarnRest(&[Allow(Target::ForeignMod), Error(Target::Param)]);
     const STABILITY: AttributeStability = AttributeStability::Stable;
 
     fn extend(
@@ -262,14 +263,10 @@ impl CombineAttributeParser for LinkParser {
     }
 
     fn finalize_check(cx: &mut FinalizeCheckContext<'_, '_>, attr_span: Span) {
-        if cx.target != Target::ForeignMod {
+        let AstTarget::ForeignMod(fm) = cx.ast_target else {
             return;
-        }
-
-        let item = cx.target_item.expect("missing AST target item for Target::ForeignMod");
-        let ItemKind::ForeignMod(fm) = &item.kind else {
-            panic!("expected foreign module AST target item for Target::ForeignMod");
         };
+
         let abi = fm.abi.map_or(ExternAbi::FALLBACK, |abi| {
             abi.symbol_unescaped.as_str().parse().unwrap_or_else(|_| {
                 cx.dcx().span_delayed_bug(
@@ -531,6 +528,7 @@ impl SingleAttributeParser for LinkSectionParser {
         Allow(Target::Method(MethodKind::Inherent)),
         Allow(Target::Method(MethodKind::Trait { body: true })),
         Allow(Target::Method(MethodKind::TraitImpl)),
+        Error(Target::Param),
     ]);
     const TEMPLATE: AttributeTemplate = template!(
         NameValueStr: "name",
@@ -685,10 +683,7 @@ impl SingleAttributeParser for LinkageParser {
     ]);
     const TEMPLATE: AttributeTemplate = template!(NameValueStr: [
         "available_externally",
-        "common",
         "extern_weak",
-        "external",
-        "internal",
         "linkonce",
         "linkonce_odr",
         "weak",
@@ -711,10 +706,7 @@ impl SingleAttributeParser for LinkageParser {
         // and don't have to be, LLVM treats them as no-ops.
         let linkage = match value {
             sym::available_externally => Linkage::AvailableExternally,
-            sym::common => Linkage::Common,
             sym::extern_weak => Linkage::ExternalWeak,
-            sym::external => Linkage::External,
-            sym::internal => Linkage::Internal,
             sym::linkonce => Linkage::LinkOnceAny,
             sym::linkonce_odr => Linkage::LinkOnceODR,
             sym::weak => Linkage::WeakAny,
@@ -725,10 +717,7 @@ impl SingleAttributeParser for LinkageParser {
                     name_value.value_span,
                     &[
                         sym::available_externally,
-                        sym::common,
                         sym::extern_weak,
-                        sym::external,
-                        sym::internal,
                         sym::linkonce,
                         sym::linkonce_odr,
                         sym::weak,

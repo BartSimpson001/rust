@@ -1,4 +1,6 @@
 //@ edition:2015..2021
+#![feature(abort_immediate)]
+#![feature(const_abort)]
 #![allow(non_fmt_panics)]
 #![crate_type = "lib"]
 
@@ -39,3 +41,9 @@ const W_CORE: () = core::panic!(MSG);
 
 const W2_CORE: () = core::panic!("{}", MSG);
 //~^ ERROR evaluation panicked
+
+const ABORT: () = std::process::abort();
+//~^ ERROR the program aborted execution
+
+const CRASH: () = core::process::crash();
+//~^ ERROR the program aborted execution

@@ -269,6 +269,7 @@
 //
 // Language features:
 // tidy-alphabetical-start
+#![feature(abort_immediate)]
 #![feature(alloc_error_handler)]
 #![feature(allocator_internals)]
 #![feature(allow_internal_unsafe)]
@@ -279,6 +280,7 @@
 #![feature(cfg_target_has_threads)]
 #![feature(cfg_target_thread_local)]
 #![feature(cfi_encoding)]
+#![feature(const_eval_select)]
 #![feature(const_trait_impl)]
 #![feature(decl_macro)]
 #![feature(deprecated_suggestion)]
@@ -287,7 +289,6 @@
 #![feature(doc_masked)]
 #![feature(doc_notable_trait)]
 #![feature(dropck_eyepatch)]
-#![feature(exact_div)]
 #![feature(f16)]
 #![feature(f128)]
 #![feature(ffi_const)]
@@ -302,7 +303,6 @@
 #![feature(must_not_suspend)]
 #![feature(needs_panic_runtime)]
 #![feature(negative_impls)]
-#![feature(optimize_attribute)]
 #![feature(prelude_import)]
 #![feature(rustc_attrs)]
 #![feature(rustdoc_internals)]
@@ -313,14 +313,13 @@
 #![feature(try_blocks)]
 #![feature(try_trait_v2)]
 #![feature(type_alias_impl_trait)]
-#![feature(unwrap_infallible)]
 // tidy-alphabetical-end
 //
 // Library features (core):
 // tidy-alphabetical-start
 #![feature(borrowed_buf_init)]
-#![feature(bstr)]
-#![feature(bstr_internals)]
+#![feature(byte_str)]
+#![feature(byte_str_internals)]
 #![feature(c_size_t)]
 #![feature(can_vector)]
 #![feature(cast_maybe_uninit)]
@@ -334,7 +333,6 @@
 #![feature(core_io)]
 #![feature(core_io_borrowed_buf)]
 #![feature(core_io_internals)]
-#![feature(cstr_display)]
 #![feature(cursor_split)]
 #![feature(derive_const)]
 #![feature(duration_constants)]
@@ -347,14 +345,12 @@
 #![feature(fmt_internals)]
 #![feature(fn_static)]
 #![feature(formatting_options)]
-#![feature(funnel_shifts)]
 #![feature(generic_atomic)]
 #![feature(hash_map_internals)]
 #![feature(hash_map_macro)]
 #![feature(hasher_prefixfree_extras)]
 #![feature(hashmap_internals)]
 #![feature(hint_must_use)]
-#![feature(int_from_ascii)]
 #![feature(io_error_inprogress)]
 #![feature(io_error_input_output_error)]
 #![feature(io_error_more)]
@@ -362,6 +358,7 @@
 #![feature(io_error_uncategorized)]
 #![feature(io_slice_as_bytes)]
 #![feature(ip)]
+#![feature(ipv6_hop_limit)]
 #![feature(iter_advance_by)]
 #![feature(iter_next_chunk)]
 #![feature(maybe_dangling)]
@@ -374,17 +371,16 @@
 #![feature(pointer_is_aligned_to)]
 #![feature(portable_simd)]
 #![feature(ptr_as_uninit)]
-#![feature(ptr_cast_slice)]
 #![feature(ptr_mask)]
 #![feature(random)]
 #![feature(raw_os_error_ty)]
+#![feature(register_tool)]
 #![feature(seek_io_take_position)]
 #![feature(seek_stream_len)]
 #![feature(share_trait)]
 #![feature(slice_internals)]
 #![feature(slice_ptr_get)]
 #![feature(slice_range)]
-#![feature(slice_split_once)]
 #![feature(std_internals)]
 #![feature(str_internals)]
 #![feature(sync_unsafe_cell)]
@@ -453,6 +449,10 @@
     link = "https://github.com/rust-lang/rust/issues/29599#issuecomment-2986866250",
     since = "1.90.0"
 )]
+// tidy-alphabetical-start
+#![register_tool(lint)]
+// tidy-alphabetical-end
+//
 
 // The Rust prelude
 // The compiler expects the prelude definition to be defined before its use statement.
@@ -628,8 +628,8 @@ pub mod f64;
 pub mod thread;
 pub mod ascii;
 pub mod backtrace;
-#[unstable(feature = "bstr", issue = "134915")]
-pub mod bstr;
+#[unstable(feature = "byte_str", issue = "134915")]
+pub mod byte_str;
 pub mod collections;
 pub mod env;
 pub mod error;
@@ -642,7 +642,7 @@ pub mod num;
 #[allow(unreachable_pub)]
 pub mod os;
 pub mod panic;
-#[unstable(feature = "pattern_type_macro", issue = "123646")]
+#[unstable(feature = "pattern_types", issue = "123646")]
 pub mod pat;
 pub mod path;
 pub mod process;
@@ -650,7 +650,7 @@ pub mod process;
 pub mod random;
 pub mod sync;
 pub mod time;
-#[unstable(feature = "view_type_macro", issue = "155938")]
+#[unstable(feature = "view_types", issue = "155938")]
 pub mod view;
 
 // Pull in `std_float` crate  into std. The contents of
@@ -714,16 +714,16 @@ pub mod arch {
     pub use std_detect::is_arm_feature_detected;
     #[stable(feature = "stdarch_loongarch_feature", since = "1.89.0")]
     pub use std_detect::is_loongarch_feature_detected;
+    #[unstable(feature = "stdarch_mips_feature_detection", issue = "111188")]
+    pub use std_detect::is_mips_feature_detected;
+    #[unstable(feature = "stdarch_powerpc_feature_detection", issue = "111191")]
+    pub use std_detect::is_powerpc_feature_detected;
     #[stable(feature = "riscv_ratified", since = "1.78.0")]
     pub use std_detect::is_riscv_feature_detected;
     #[stable(feature = "stdarch_s390x_feature_detection", since = "1.93.0")]
     pub use std_detect::is_s390x_feature_detected;
     #[stable(feature = "simd_x86", since = "1.27.0")]
     pub use std_detect::is_x86_feature_detected;
-    #[unstable(feature = "stdarch_mips_feature_detection", issue = "111188")]
-    pub use std_detect::{is_mips_feature_detected, is_mips64_feature_detected};
-    #[unstable(feature = "stdarch_powerpc_feature_detection", issue = "111191")]
-    pub use std_detect::{is_powerpc_feature_detected, is_powerpc64_feature_detected};
 }
 
 // This was stabilized in the crate root so we have to keep it there.
@@ -758,7 +758,7 @@ pub use core::concat_bytes;
 )]
 #[unstable(feature = "derive_macro_global_path", issue = "154645")]
 pub use core::derive;
-#[unstable(feature = "gca_min_const_items", issue = "132980")]
+#[unstable(feature = "gca_min_const_items", issue = "132980", implied_by = "gca_adts")]
 pub use core::gca;
 #[stable(feature = "matches_macro", since = "1.42.0")]
 pub use core::matches;

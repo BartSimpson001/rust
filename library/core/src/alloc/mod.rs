@@ -27,15 +27,15 @@ use crate::ptr::{self, NonNull};
 /// that may be due to resource exhaustion or to
 /// something wrong when combining the given input arguments with this
 /// allocator.
-#[stable(feature = "allocator_api", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "allocator_api", since = "1.100.0")]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct AllocError;
 
-#[stable(feature = "allocator_api", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "allocator_api", since = "1.100.0")]
 impl Error for AllocError {}
 
 // (we need this for downstream impl of trait Error)
-#[stable(feature = "allocator_api", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "allocator_api", since = "1.100.0")]
 impl fmt::Display for AllocError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("memory allocation failed")
@@ -54,6 +54,43 @@ impl fmt::Display for AllocError {
 /// In contrast to [`GlobalAlloc`][], `Allocator` allows zero-sized allocations. If an underlying
 /// allocator does not support this (like jemalloc) or responds by returning a null pointer
 /// (such as `libc::malloc`), this must be caught by the implementation.
+///
+/// # Examples
+///
+/// Sample that keeps track of the number of existing allocations:
+///
+/// ```
+/// use std::alloc::{AllocError, Allocator, Layout, System};
+/// use std::ptr::NonNull;
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+///
+/// static LIVE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+///
+/// struct CountingAllocator;
+///
+/// unsafe impl Allocator for CountingAllocator {
+///     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+///         let ptr = System.allocate(layout)?;
+///         LIVE_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+///         Ok(ptr)
+///     }
+///
+///     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+///         // SAFETY: the caller guarantees `ptr` was allocated by this allocator with `layout`,
+///         // and every block from this allocator was allocated by `System` with the same layout.
+///         unsafe { System.deallocate(ptr, layout) };
+///         LIVE_ALLOCATIONS.fetch_sub(1, Ordering::Relaxed);
+///     }
+/// }
+///
+/// // The Box allocates through our allocator.
+/// let new_box = Box::new_in(10, CountingAllocator);
+/// assert_eq!(LIVE_ALLOCATIONS.load(Ordering::Relaxed), 1);
+/// drop(new_box);
+/// assert_eq!(LIVE_ALLOCATIONS.load(Ordering::Relaxed), 0);
+/// ```
+///
+/// ## Implementation Requirements
 ///
 /// In order to be usable in a flexible manner while still being sound, implementors of the trait
 /// must uphold very detailed semantics as explained below; the following terms are thus provided
@@ -193,7 +230,7 @@ impl fmt::Display for AllocError {
 // and make sure they cannot be triggered before relaxing this:
 // https://rust.tf/156490
 // https://rust.tf/159982
-#[stable(feature = "allocator_api", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "allocator_api", since = "1.100.0")]
 #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
 pub const unsafe trait Allocator {
     /// Attempts to allocate a block of memory.
@@ -206,6 +243,10 @@ pub const unsafe trait Allocator {
     /// is cheap; there is no guarantee that the caller is able to take advantage of the
     /// returned excess. Implementors are free to e.g. provide an alternate method to query
     /// available excess if doing so is expensive and should be left to the caller.
+    ///
+    /// The returned block may be uninitialized, so it is unsound to read it
+    /// before it is written. Use [`allocate_zeroed`](Self::allocate_zeroed) if
+    /// zero-initialized memory is needed.
     ///
     /// Note that the returned block of memory is considered [*currently allocated*]
     /// with this allocator (and equivalent allocators).
@@ -228,7 +269,29 @@ pub const unsafe trait Allocator {
     /// call the [`handle_alloc_error`] function, rather than directly invoking `panic!` or similar.
     ///
     /// [`handle_alloc_error`]: ../../alloc/alloc/fn.handle_alloc_error.html
-    #[stable(feature = "allocator_api", since = "CURRENT_RUSTC_VERSION")]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::alloc::{Allocator, Layout, System};
+    ///
+    /// let s = "Hello, world!";
+    /// let layout = Layout::array::<u8>(s.len()).unwrap();
+    // FIXME(slice_ptr_get): use `.as_mut_ptr()` once stable
+    /// let ptr = System.allocate(layout).expect("allocation failed").cast::<u8>();
+    ///
+    /// // SAFETY: the block is at least `s.len()` bytes long and was just allocated,
+    /// // so it cannot overlap `s`.
+    /// unsafe { ptr.as_ptr().copy_from_nonoverlapping(s.as_ptr(), s.len()) };
+    ///
+    /// // SAFETY: the first `s.len()` bytes were initialized by the copy above.
+    /// let bytes = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), s.len()) };
+    /// assert_eq!(bytes, s.as_bytes());
+    ///
+    /// // SAFETY: `ptr` was allocated by `System` with `layout`.
+    /// unsafe { System.deallocate(ptr, layout) };
+    /// ```
+    #[stable(feature = "allocator_api", since = "1.100.0")]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError>;
 
     /// Behaves like `allocate`, but also ensures that the returned memory is zero-initialized.
@@ -246,7 +309,25 @@ pub const unsafe trait Allocator {
     /// call the [`handle_alloc_error`] function, rather than directly invoking `panic!` or similar.
     ///
     /// [`handle_alloc_error`]: ../../alloc/alloc/fn.handle_alloc_error.html
-    #[stable(feature = "allocator_api", since = "CURRENT_RUSTC_VERSION")]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::alloc::{Allocator, Layout, System};
+    ///
+    /// let layout = Layout::new::<u64>();
+    /// let ptr = System.allocate_zeroed(layout).expect("allocation failed");
+    ///
+    /// // N.B. the below would be unsound with `allocate` rather than `allocate_zeroed`.
+    /// // SAFETY: `allocate_zeroed` returns a valid, initialized block.
+    /// let bytes = unsafe { ptr.as_ref() };
+    /// assert!(bytes.iter().all(|&b| b == 0));
+    ///
+    /// // SAFETY: `ptr` was allocated by `System` with `layout`.
+    // FIXME(slice_ptr_get): use `.as_mut_ptr()` once stable
+    /// unsafe { System.deallocate(ptr.cast(), layout) };
+    /// ```
+    #[stable(feature = "allocator_api", since = "1.100.0")]
     fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let ptr = self.allocate(layout)?;
         // SAFETY: `alloc` returns a valid memory block
@@ -270,7 +351,7 @@ pub const unsafe trait Allocator {
     ///
     /// [*currently allocated*]: #currently-allocated-memory
     /// [*fit*]: #memory-fitting
-    #[stable(feature = "allocator_api", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "allocator_api", since = "1.100.0")]
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout);
 
     /// Attempts to extend the memory block.
@@ -282,7 +363,9 @@ pub const unsafe trait Allocator {
     /// If this returns `Ok`, then the memory block referenced by `ptr` has been [*invalidated*].
     /// The old `ptr` must not be used to access the memory, even if the allocation was grown in-place.
     /// The newly returned pointer is the only valid pointer for accessing this memory now.
-    /// All bytes past `old_layout.size()` should be assumed to be uninitialised.
+    /// All bytes past `old_layout.size()` should be assumed to be uninitialised, so it is
+    /// unsound to read them before they are written. Use [`grow_zeroed`](Self::grow_zeroed)
+    /// if the new bytes should be zero-initialized.
     ///
     /// If this method returns `Err`, then the memory block has not been *invalidated*,
     /// and the contents of the memory block are unaltered.
@@ -312,7 +395,46 @@ pub const unsafe trait Allocator {
     /// call the [`handle_alloc_error`] function, rather than directly invoking `panic!` or similar.
     ///
     /// [`handle_alloc_error`]: ../../alloc/alloc/fn.handle_alloc_error.html
-    #[stable(feature = "allocator_api", since = "CURRENT_RUSTC_VERSION")]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::alloc::{Allocator, Layout, System};
+    ///
+    /// let s1 = "Hello";
+    /// let s2 = ", world!";
+    ///
+    /// let old_layout = Layout::array::<u8>(s1.len()).unwrap();
+    // FIXME(slice_ptr_get): use `.as_mut_ptr()` once stable
+    /// let ptr = System.allocate(old_layout).expect("allocation failed").cast::<u8>();
+    ///
+    /// // SAFETY: the block is at least `s1.len()` bytes long and was just allocated,
+    /// // so it cannot overlap `s1`.
+    /// unsafe { ptr.as_ptr().copy_from_nonoverlapping(s1.as_ptr(), s1.len()) };
+    ///
+    /// let new_layout = Layout::array::<u8>(s1.len() + s2.len()).unwrap();
+    ///
+    /// // N.B. the original `ptr` is invalidated by this operation
+    /// // SAFETY: `ptr` is currently allocated by `System` with `old_layout`,
+    /// // and `new_layout` is at least as large as `old_layout`.
+    // FIXME(slice_ptr_get): use `.as_mut_ptr()` once stable
+    /// let ptr = unsafe { System.grow(ptr, old_layout, new_layout) }
+    ///     .expect("grow failed").cast::<u8>();
+    ///
+    /// // SAFETY: the block is at least `s1.len() + s2.len()` bytes long, so writing
+    /// // `s2.len()` bytes at offset `s1.len()` stays in bounds; it cannot overlap `s2`.
+    /// unsafe {
+    ///     ptr.as_ptr().add(s1.len()).copy_from_nonoverlapping(s2.as_ptr(), s2.len());
+    /// }
+    ///
+    /// // SAFETY: all bytes within `new_layout.size()` are now initialized.
+    /// let bytes = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), new_layout.size()) };
+    /// assert_eq!(bytes, b"Hello, world!");
+    ///
+    /// // SAFETY: `ptr` is currently allocated by `System` with `new_layout`.
+    /// unsafe { System.deallocate(ptr, new_layout) };
+    /// ```
+    #[stable(feature = "allocator_api", since = "1.100.0")]
     unsafe fn grow(
         &self,
         ptr: NonNull<u8>,
@@ -373,7 +495,7 @@ pub const unsafe trait Allocator {
     /// call the [`handle_alloc_error`] function, rather than directly invoking `panic!` or similar.
     ///
     /// [`handle_alloc_error`]: ../../alloc/alloc/fn.handle_alloc_error.html
-    #[stable(feature = "allocator_api", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "allocator_api", since = "1.100.0")]
     unsafe fn grow_zeroed(
         &self,
         ptr: NonNull<u8>,
@@ -440,7 +562,34 @@ pub const unsafe trait Allocator {
     /// call the [`handle_alloc_error`] function, rather than directly invoking `panic!` or similar.
     ///
     /// [`handle_alloc_error`]: ../../alloc/alloc/fn.handle_alloc_error.html
-    #[stable(feature = "allocator_api", since = "CURRENT_RUSTC_VERSION")]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::alloc::{Allocator, Layout, System};
+    ///
+    /// let old_layout = Layout::array::<u32>(4).unwrap();
+    /// let ptr = System.allocate(old_layout).expect("allocation failed");
+    ///
+    /// // SAFETY: the block holds at least 4 `u32`s and is aligned for `u32`.
+    /// unsafe { ptr.cast::<[u32; 4]>().write([7, 8, 9, 10]) };
+    ///
+    /// let new_layout = Layout::array::<u32>(2).unwrap();
+    ///
+    /// // N.B. the original `ptr` is invalidated by this operation
+    /// // SAFETY: `ptr` is currently allocated by `System` with `old_layout`,
+    /// // and `new_layout` is no larger than `old_layout`.
+    /// let ptr = unsafe { System.shrink(ptr.cast(), old_layout, new_layout) }
+    ///     .expect("shrink failed");
+    ///
+    /// // The contents that fit in the new layout are preserved.
+    /// // SAFETY: the first two `u32`s were written above and `shrink` kept them.
+    /// assert_eq!(unsafe { ptr.cast::<[u32; 2]>().read() }, [7, 8]);
+    ///
+    /// // SAFETY: `ptr` is currently allocated by `System` with `new_layout`.
+    /// unsafe { System.deallocate(ptr.cast(), new_layout) };
+    /// ```
+    #[stable(feature = "allocator_api", since = "1.100.0")]
     unsafe fn shrink(
         &self,
         ptr: NonNull<u8>,
@@ -574,7 +723,7 @@ pub unsafe trait AllocatorClone: Allocator + Clone {}
 #[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")]
 pub unsafe trait StaticAllocator: Allocator {}
 
-#[stable(feature = "allocator_api", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "allocator_api", since = "1.100.0")]
 #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
 const unsafe impl<A> Allocator for &A
 where
@@ -630,7 +779,7 @@ where
     }
 }
 
-#[stable(feature = "allocator_api", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "allocator_api", since = "1.100.0")]
 #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
 const unsafe impl<A> Allocator for &mut A
 where
@@ -686,6 +835,11 @@ where
     }
 }
 
+/// Defers to the pinned allocator. Requires that the smart pointer inside the
+/// [`Pin`](core::pin::Pin) is well-behaved.
+///
+/// This trait impl is unstable and only usable on nightly with `feature(allocator_ext)`.
+/// It may be changed or removed in the future.
 #[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")]
 #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
 #[unstable_feature_bound(allocator_ext)]
@@ -743,6 +897,14 @@ where
     }
 }
 
+/// This trait impl is unstable and only usable on nightly with `feature(allocator_ext)`.
+#[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")]
+#[unstable_feature_bound(allocator_ext)]
+impl<P> AllocatorNightly for core::pin::Pin<P> where
+    P: core::ops::Deref<Target: Allocator> + core::pin::PinSafePointer
+{
+}
+
 #[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")]
 unsafe impl<A: Allocator + ?Sized> AllocatorClone for &A {}
 
@@ -753,3 +915,31 @@ unsafe impl<A: StaticAllocator + ?Sized> StaticAllocator for &A {}
 
 #[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")]
 unsafe impl<A: StaticAllocator + ?Sized> StaticAllocator for &mut A {}
+
+/// Allocator marker trait that is only implemented stably for `Global`.
+///
+/// Enabling `feature(allocator_ext)` causes this trait to be implemented for all
+/// allocators in std, and for any downstream allocator that explicitly implements it.
+///
+/// This trait is used as a bound whenever a function constructing
+/// a type with an `#[unstable] A: Allocator = Global` parameter
+/// may be callable for `A != Global`.
+///
+/// This is to prevent stable code from e.g. constructing `Arc<T, NotGlobal>`
+/// using the `From<Box<T, A>> for Arc<T, A>` impl.
+///
+/// Note that this trait *will* be removed in the future, but downstream
+/// allocators should still feel free to implement it on nightly, to
+/// allow their allocator to be used with all unstable allocator APIs.
+#[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")]
+pub trait AllocatorNightly: Allocator {}
+
+/// This trait impl is unstable and only usable on nightly with `feature(allocator_ext)`.
+#[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")]
+#[unstable_feature_bound(allocator_ext)]
+impl<A: Allocator + ?Sized> AllocatorNightly for &A {}
+
+/// This trait impl is unstable and only usable on nightly with `feature(allocator_ext)`.
+#[unstable(feature = "allocator_ext", issue = "163177", implied_by = "allocator_api")]
+#[unstable_feature_bound(allocator_ext)]
+impl<A: Allocator + ?Sized> AllocatorNightly for &mut A {}

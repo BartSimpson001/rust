@@ -2,19 +2,51 @@
 //! runtime or const-eval processable way.
 
 use crate::any::TypeId;
-use crate::fmt;
-use crate::intrinsics::{self, type_id, type_of};
 use crate::marker::PointeeSized;
 use crate::ptr::DynMetadata;
+use crate::{fmt, intrinsics};
 
 /// Compile-time type information.
 #[derive(Debug)]
 #[non_exhaustive]
-#[lang = "type_info"]
+#[lang = "type_kind"]
 #[unstable(feature = "type_info", issue = "146922")]
-pub struct Type {
-    /// Per-type information
-    pub kind: TypeKind,
+pub enum TypeKind {
+    /// Tuples.
+    Tuple,
+    /// Arrays.
+    Array,
+    /// Slices.
+    Slice,
+    /// Dynamic Traits.
+    DynTrait,
+    /// Structs.
+    Struct,
+    /// Enums.
+    Enum,
+    /// Unions.
+    Union,
+    /// Primitive boolean type.
+    Bool,
+    /// Primitive character type.
+    Char,
+    /// Primitive signed and unsigned integer type.
+    Int,
+    /// Primitive floating-point type.
+    Float,
+    /// String slice type.
+    Str,
+    /// References.
+    Reference,
+    /// Pointers.
+    Pointer,
+    /// Function pointers.
+    FnPtr,
+    /// Never type.
+    Never,
+    /// FIXME(#146922): add all the common types
+    /// non exhaustive list
+    Other,
 }
 
 /// Info of a trait implementation, you can retrieve the vtable with [Self::get_vtable]
@@ -37,12 +69,12 @@ impl TypeId {
     #[unstable(feature = "type_info", issue = "146922")]
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
-    pub fn info(self) -> Type {
-        type_of(self)
+    pub fn info(self) -> TypeKind {
+        intrinsics::reflection::type_id_type_of(self)
     }
 }
 
-impl Type {
+impl TypeKind {
     /// Returns the type information of the generic type parameter.
     ///
     /// Note: Unlike `TypeId`s obtained via `TypeId::of`, the `Type`
@@ -54,7 +86,7 @@ impl Type {
     #[unstable(feature = "type_info", issue = "146922")]
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     pub const fn of<T: ?Sized>() -> Self {
-        const { type_id::<T>().info() }
+        const { intrinsics::reflection::type_id::<T>().info() }
     }
 }
 
@@ -67,54 +99,14 @@ impl Type {
 #[unstable(feature = "type_info", issue = "146922")]
 #[rustc_const_unstable(feature = "type_info", issue = "146922")]
 pub const fn of<T: ?Sized>() -> TypeId {
-    const { intrinsics::type_id::<T>() }
-}
-
-/// Compile-time type information.
-#[derive(Debug)]
-#[non_exhaustive]
-#[unstable(feature = "type_info", issue = "146922")]
-pub enum TypeKind {
-    /// Tuples.
-    Tuple,
-    /// Arrays.
-    Array,
-    /// Slices.
-    Slice,
-    /// Dynamic Traits.
-    DynTrait(DynTrait),
-    /// Structs.
-    Struct,
-    /// Enums.
-    Enum,
-    /// Unions.
-    Union,
-    /// Primitive boolean type.
-    Bool,
-    /// Primitive character type.
-    Char,
-    /// Primitive signed and unsigned integer type.
-    Int,
-    /// Primitive floating-point type.
-    Float,
-    /// String slice type.
-    Str(Str),
-    /// References.
-    Reference,
-    /// Pointers.
-    Pointer,
-    /// Function pointers.
-    FnPtr,
-    /// FIXME(#146922): add all the common types
-    /// non exhaustive list:
-    /// - Never
-    Other,
+    const { intrinsics::reflection::type_id::<T>() }
 }
 
 /// Compile-time type information about dynamic traits.
 /// FIXME(#146922): Add super traits and generics
 #[derive(Debug)]
 #[non_exhaustive]
+#[lang = "DynTrait"]
 #[unstable(feature = "type_info", issue = "146922")]
 pub struct DynTrait {
     /// The predicates of  a dynamic trait.
@@ -272,7 +264,7 @@ impl TypeId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn is_signed(self) -> bool {
-        intrinsics::type_id_is_signed(self)
+        intrinsics::reflection::type_id_is_signed(self)
     }
 
     /// When called on a `TypeId` representing an array or slice this returns the type of each
@@ -291,7 +283,40 @@ impl TypeId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn element_ty(self) -> Option<TypeId> {
-        intrinsics::type_id_element_ty(self)
+        intrinsics::reflection::type_id_element_ty(self)
+    }
+
+    /// Given a `TypeId` that represents a dyn trait returns an
+    /// [`DynTrait`]. When called on something else this returns `None`.
+    ///
+    /// # Examples
+    ///
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// use std::any::TypeId;
+    /// use std::fmt::Debug;
+    ///
+    /// #[derive(Debug)]
+    /// struct A;
+    ///
+    /// const {
+    ///     let dyn_id = TypeId::of::<dyn Debug + Send>();
+    ///     let predicates = dyn_id.dyn_trait().unwrap().predicates;
+    ///
+    ///     let debug_ty = predicates[0].trait_ty.ty;
+    ///     let send_ty = predicates[1].trait_ty.ty;
+    ///
+    ///     let type_id = TypeId::of::<A>();
+    ///
+    ///     assert!(type_id.trait_info_of_trait_type_id(debug_ty).is_some());
+    ///     assert!(type_id.trait_info_of_trait_type_id(send_ty).is_none());
+    /// }
+    /// ```
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn dyn_trait(self) -> Option<DynTrait> {
+        intrinsics::reflection::type_id_dyn_trait(self)
     }
 
     /// When called on a `TypeId` representing an array this returns the length of the array in
@@ -310,7 +335,7 @@ impl TypeId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn array_len(self) -> usize {
-        intrinsics::type_id_array_len(self)
+        intrinsics::reflection::type_id_array_len(self)
     }
 
     /// Returns the size of the type represented by this `TypeId`. `None` if it is unsized.
@@ -328,7 +353,7 @@ impl TypeId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn size(self) -> Option<usize> {
-        intrinsics::size_of_type_id(self)
+        intrinsics::reflection::type_id_size_of(self)
     }
 
     /// Returns the number of variants of the type represented by this `TypeId`.
@@ -354,7 +379,7 @@ impl TypeId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn variants(self) -> usize {
-        intrinsics::type_id_variants(self)
+        intrinsics::reflection::type_id_variants(self)
     }
 
     // FIXME(reflection): make the errors nicer. This is a wider problem,
@@ -416,7 +441,7 @@ impl TypeId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn variant(self, variant_index: usize) -> VariantId {
-        intrinsics::type_id_fields(self, variant_index);
+        intrinsics::reflection::type_id_fields(self, variant_index);
         VariantId { base: self, variant: variant_index }
     }
 
@@ -484,7 +509,7 @@ impl TypeId {
     // type we have) and add methods on that. It's the only way to really sensibly represent
     // things like `non_exhaustive` which can be applied to variants as well.
     pub fn fields(self, variant_index: usize) -> usize {
-        intrinsics::type_id_fields(self, variant_index)
+        intrinsics::reflection::type_id_fields(self, variant_index)
     }
 
     /// Returns the field representing type at the given index of the type represented by this `TypeId`.
@@ -552,7 +577,7 @@ impl TypeId {
     #[rustc_comptime]
     pub fn field(self, variant_index: usize, field_index: usize) -> FieldId {
         FieldId {
-            frt_type_id: intrinsics::type_id_field_representing_type(
+            frt_type_id: intrinsics::reflection::type_id_field_representing_type(
                 self,
                 variant_index,
                 field_index,
@@ -566,7 +591,7 @@ impl TypeId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn non_exhaustive(self) -> bool {
-        intrinsics::non_exhaustive(self)
+        intrinsics::reflection::type_id_non_exhaustive(self)
     }
 
     /// Returns a list of generic parameters of the type.
@@ -575,7 +600,7 @@ impl TypeId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn generics(self) -> &'static [Generic] {
-        intrinsics::type_id_generics(self)
+        intrinsics::reflection::type_id_generics(self)
     }
 
     /// Given a `TypeId` that represents a pointer this returns the `TypeId`
@@ -600,7 +625,7 @@ impl TypeId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn points_to(self) -> Option<TypeId> {
-        intrinsics::type_id_points_to(self)
+        intrinsics::reflection::type_id_points_to(self)
     }
 
     /// Given a `TypeId` that represents a pointer returns whether that pointer is mutable.
@@ -620,7 +645,7 @@ impl TypeId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn points_mutably(self) -> bool {
-        intrinsics::type_id_points_mutably(self)
+        intrinsics::reflection::type_id_points_mutably(self)
     }
 
     /// Given a `TypeId` that represents a function pointer returns an
@@ -655,7 +680,50 @@ impl TypeId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn function_ptr(self) -> Option<FnPtr> {
-        intrinsics::type_id_function_ptr(self)
+        intrinsics::reflection::type_id_function_ptr(self)
+    }
+
+    /// Given given a `TypeId`, which represents a structure, enum or union returns a list of attributes.
+    /// Only the attributes of tools marked as `reflect` are returned, all other attributes are excluded.
+    /// The attributes are in a string representation.
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// #![feature(register_tool)]
+    /// #![register_tool(foo(reflect))]
+    /// # use std::any::TypeId;
+    ///
+    /// #[foo::a(1, false)]
+    /// #[foo::bar=123]
+    /// struct A;
+    ///
+    /// assert_eq!(const { TypeId::of::<A>().reflected_attrs() }, ["#[foo::a(1, false)]", "#[foo::bar = 123]"]);
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn reflected_attrs(self) -> &'static [&'static str] {
+        intrinsics::reflection::type_id_reflected_attrs(self)
+    }
+
+    /// Returns the raw documentation attributes when given a `TypeId` which represents a structure, enumeration or union.
+    /// ```
+    /// #![feature(type_info)]
+    /// # use std::any::TypeId;
+    ///
+    /// #[doc = "first"]
+    /// /** second
+    /// *  third
+    /// */
+    /// struct A;
+    ///
+    /// assert_eq!(const { TypeId::of::<A>().docs() }, ["first", " second\n*  third\n"]);
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn docs(self) -> &'static [&'static str] {
+        intrinsics::reflection::type_id_docs(self)
     }
 }
 
@@ -696,7 +764,29 @@ impl VariantId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn name(self) -> &'static str {
-        intrinsics::variant_name(self.base, self.variant)
+        intrinsics::reflection::type_id_variant_name(self.base, self.variant)
+    }
+
+    /// Returns the raw documentation attributes when given a `VariantId`.
+    /// ```
+    /// #![feature(type_info)]
+    /// # use std::any::TypeId;
+    ///
+    /// enum A {
+    ///     #[doc = "first"]
+    ///     /** second
+    ///      * third*/
+    ///     B,
+    ///     C,
+    /// }
+    ///
+    /// assert_eq!(const { TypeId::of::<A>().variant(0).docs() }, ["first", " second\n     * third"]);
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn docs(self) -> &'static [&'static str] {
+        intrinsics::reflection::type_id_variant_docs(self.base, self.variant)
     }
 
     /// Returns whether this variant is marked with `#[non_exhaustive]`.
@@ -704,7 +794,33 @@ impl VariantId {
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
     #[rustc_comptime]
     pub fn non_exhaustive(self) -> bool {
-        intrinsics::variant_non_exhaustive(self.base, self.variant)
+        intrinsics::reflection::type_id_variant_non_exhaustive(self.base, self.variant)
+    }
+
+    /// Given given a `VariantId` returns a list of attributes.
+    /// Only the attributes of tools marked as `reflect` are returned, all other attributes are excluded.
+    /// The attributes are in a string representation.
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// #![feature(register_tool)]
+    /// #![register_tool(foo(reflect))]
+    /// # use std::any::TypeId;
+    ///
+    /// enum A {
+    ///     #[foo::a(1, false)]
+    ///     #[foo::bar=123]
+    ///     VarA,
+    ///     VarB,
+    /// }
+    ///
+    /// assert_eq!(const { TypeId::of::<A>().variant(0).reflected_attrs() }, &["#[foo::a(1, false)]", "#[foo::bar = 123]"]);
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn reflected_attrs(self) -> &'static [&'static str] {
+        intrinsics::reflection::type_id_variant_reflected_attrs(self.base, self.variant)
     }
 }
 
@@ -767,6 +883,27 @@ impl FieldId {
     pub fn name(self) -> &'static str {
         intrinsics::field_representing_type_name(self.frt_type_id)
     }
+
+    /// Returns the raw documentation attributes when given a `FieldId`.
+    /// ```
+    /// #![feature(type_info)]
+    /// # use std::any::TypeId;
+    ///
+    /// struct A {
+    ///     #[doc = "first"]
+    ///     /// second
+    ///     first: u8,
+    /// }
+    ///
+    /// assert_eq!(const { TypeId::of::<A>().field(0, 0).docs() }, ["first", " second"]);
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn docs(self) -> &'static [&'static str] {
+        intrinsics::reflection::type_id_docs(self.frt_type_id)
+    }
+
     /// Returns the offset of the field wrt to its containing type.
     ///
     /// ```
@@ -788,5 +925,30 @@ impl FieldId {
     #[rustc_comptime]
     pub fn offset(self) -> usize {
         intrinsics::field_representing_type_offset(self.frt_type_id)
+    }
+
+    /// Given given a `FieldId` returns a list of attributes.
+    /// Only the attributes of tools marked as `reflect` are returned, all other attributes are excluded.
+    /// The attributes are in a string representation.
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// #![feature(register_tool)]
+    /// #![register_tool(foo(reflect))]
+    /// # use std::any::TypeId;
+    ///
+    /// struct A {
+    ///     #[foo::a(1, false)]
+    ///     #[foo::bar=123]
+    ///     first: u8,
+    /// }
+    ///
+    /// assert_eq!(const { TypeId::of::<A>().field(0, 0).reflected_attrs() }, &["#[foo::a(1, false)]", "#[foo::bar = 123]"]);
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    #[rustc_comptime]
+    pub fn reflected_attrs(self) -> &'static [&'static str] {
+        intrinsics::reflection::type_id_reflected_attrs(self.frt_type_id)
     }
 }

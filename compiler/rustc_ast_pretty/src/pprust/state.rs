@@ -662,12 +662,12 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
     fn print_attribute_inline(&mut self, attr: &ast::Attribute, is_inline: bool) -> bool {
         use ast::SyntheticAttr::*;
         match attr.kind {
-            AttrKind::Synthetic(CfgTrace(_) | CfgAttrTrace(_)) => {
+            AttrKind::Synthetic(CfgTrace(_) | CfgAttrTrace(_) | TestEntrypoint) => {
                 // These are internal synthetic attributes with no syntax, so avoid printing them
                 // to keep the printed code reasonably parse-able.
                 return false;
             }
-            AttrKind::Normal(_) | AttrKind::DocComment(..) => {}
+            AttrKind::Normal(_) | AttrKind::DocComment(..) | AttrKind::Generated(..) => {}
         }
         if !is_inline {
             self.hardbreak_if_not_bol();
@@ -691,6 +691,7 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
                 ));
                 self.hardbreak()
             }
+            AttrKind::Generated(generated) => self.word(generated.descr()),
         }
         true
     }
@@ -1346,20 +1347,23 @@ impl<'a> State<'a> {
                 self.print_type(ty);
                 self.word("]");
             }
-            ast::TyKind::Ptr(mt) => {
+            ast::TyKind::Ptr(ty, mutbl) => {
                 self.word("*");
-                self.print_mt(mt, true);
+                self.print_mutability(*mutbl, true);
+                self.print_type(ty);
             }
-            ast::TyKind::Ref(lifetime, mt) => {
+            ast::TyKind::Ref(lifetime, ty, mutbl) => {
                 self.word("&");
                 self.print_opt_lifetime(lifetime);
-                self.print_mt(mt, false);
+                self.print_mutability(*mutbl, false);
+                self.print_type(ty);
             }
-            ast::TyKind::PinnedRef(lifetime, mt) => {
+            ast::TyKind::PinnedRef(lifetime, ty, mutbl) => {
                 self.word("&");
                 self.print_opt_lifetime(lifetime);
                 self.word("pin ");
-                self.print_mt(mt, true);
+                self.print_mutability(*mutbl, true);
+                self.print_type(ty);
             }
             ast::TyKind::Never => {
                 self.word("!");
@@ -1433,12 +1437,15 @@ impl<'a> State<'a> {
                 self.word("...");
             }
             ast::TyKind::Pat(ty, pat) => {
+                self.word("k#pattern_type");
+                self.popen();
                 self.print_type(ty);
                 self.word(" is ");
                 self.print_ty_pat(pat);
+                self.pclose();
             }
             ast::TyKind::FieldOf(ty, variant, field) => {
-                self.word("builtin # field_of");
+                self.word("k#field_of");
                 self.popen();
                 let ib = self.ibox(0);
                 self.print_type(ty);
@@ -1455,8 +1462,11 @@ impl<'a> State<'a> {
                 self.pclose();
             }
             ast::TyKind::View(ty, fields) => {
+                self.word("k#view_type");
+                self.popen();
                 self.print_type(ty);
                 self.print_view(fields);
+                self.pclose();
             }
             ast::TyKind::GcaMacro(expr) => {
                 self.word_nbsp("core::gca!");
@@ -2008,6 +2018,11 @@ impl<'a> State<'a> {
                 self.pclose();
             }
             PatKind::Deref(inner) => {
+                // FIXME(deref_patterns, internal_syntax, forced_keywords, clippy):
+                // This should render `k#deref(...)` but unfortunately Clippy uses `pat_to_string`
+                // for the suggestions of its lint `unnested_or_patterns`. Smh fix Clippy to not
+                // rely on AST pretty printing `deref!(…)` for `Deref` patterns and please don't
+                // think about adding a flag to AST pretty to control the output.
                 self.word("deref!");
                 self.popen();
                 self.print_pat(inner);
@@ -2229,11 +2244,6 @@ impl<'a> State<'a> {
         }
     }
 
-    fn print_mt(&mut self, mt: &ast::MutTy, print_const: bool) {
-        self.print_mutability(mt.mutbl, print_const);
-        self.print_type(&mt.ty)
-    }
-
     fn print_param(&mut self, input: &ast::Param, is_closure: bool) {
         let ib = self.ibox(INDENT_UNIT);
 
@@ -2246,6 +2256,9 @@ impl<'a> State<'a> {
                     self.print_explicit_self(&eself);
                 } else {
                     if !matches!(input.pat.kind, PatKind::Missing) {
+                        if input.has_const_keyword {
+                            self.word_nbsp("const");
+                        }
                         self.print_pat(&input.pat);
                         self.word(":");
                         self.space();

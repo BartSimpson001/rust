@@ -13,12 +13,11 @@ use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_log::tracing::trace;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
 use rustc_middle::mir::interpret::{
-    self, Allocation, ConstAllocation, CtfeProvenance, ErrorHandled, Scalar as InterpScalar,
-    read_target_uint,
+    self, ConstAllocation, CtfeProvenance, ErrorHandled, Scalar as InterpScalar, read_target_uint,
 };
 use rustc_middle::mono::MonoItem;
-use rustc_middle::ty::layout::LayoutOf;
-use rustc_middle::ty::{self, Instance};
+use rustc_middle::ty::Instance;
+use rustc_middle::ty::layout::{HasTypingEnv as _, LayoutOf};
 use rustc_span::def_id::DefId;
 use rustc_span::{bug, span_bug};
 
@@ -65,14 +64,18 @@ impl<'gcc, 'tcx> StaticCodegenMethods for CodegenCx<'gcc, 'tcx> {
         let cv = const_alloc_to_gcc(self, alloc);
         let align = alloc.inner().align;
 
-        if let Some(variable) = self.const_globals.borrow().get(&cv) {
-            if let Some(global_variable) = self.global_lvalues.borrow().get(variable) {
-                let alignment = align.bits() as i32;
-                if alignment > global_variable.get_alignment() {
-                    global_variable.set_alignment(alignment);
-                }
+        if let Some(&mut (variable, ref mut global_align)) =
+            self.const_globals.borrow_mut().get_mut(&cv)
+        {
+            // `set_alignment` replaces the alignment, which is on the global's type and thus not
+            // reported by `get_alignment`: only raise it, or a smaller use would lower it.
+            if align > *global_align
+                && let Some(global_variable) = self.global_lvalues.borrow().get(&variable)
+            {
+                global_variable.set_alignment(align.bytes() as i32);
+                *global_align = align;
             }
-            return *variable;
+            return variable;
         }
         let global_value = self.static_addr_of_mut(cv, align, kind);
         #[cfg(feature = "master")]
@@ -81,7 +84,7 @@ impl<'gcc, 'tcx> StaticCodegenMethods for CodegenCx<'gcc, 'tcx> {
             .get(&global_value)
             .expect("`static_addr_of_mut` did not add the global to `self.global_lvalues`")
             .global_set_readonly();
-        self.const_globals.borrow_mut().insert(cv, global_value);
+        self.const_globals.borrow_mut().insert(cv, (global_value, align));
         global_value
     }
 
@@ -104,7 +107,7 @@ impl<'gcc, 'tcx> StaticCodegenMethods for CodegenCx<'gcc, 'tcx> {
         let is_thread_local = attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL);
         let global = self.get_static_inner(def_id, val_llty);
 
-        debug_assert_eq!(
+        assert_eq!(
             global.to_rvalue().get_type(),
             val_llty,
             "`predefine_static` declared this global with a type its initializer does not have"
@@ -113,12 +116,7 @@ impl<'gcc, 'tcx> StaticCodegenMethods for CodegenCx<'gcc, 'tcx> {
         // NOTE: Alignment from attributes has already been applied to the allocation.
         set_global_alignment(self, global, alloc.align);
 
-        // A common symbol is storage the linker allocates and zero-fills, so giving the definition
-        // an initializer — even an all-zero one — takes it back out of `.comm`. A non-zero one is
-        // kept: the symbol is then an ordinary definition, which is what GCC does with it too.
-        if attrs.linkage != Some(Linkage::Common) || !is_zero_initializer(alloc) {
-            global.global_set_initializer_rvalue(value);
-        }
+        global.global_set_initializer_rvalue(value);
 
         // As an optimization, all shared statics which do not have interior
         // mutability are placed into read-only memory.
@@ -257,7 +255,7 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
         let gcc_type = if nested {
             self.type_i8()
         } else {
-            let ty = instance.ty(self.tcx, ty::TypingEnv::fully_monomorphized());
+            let ty = instance.ty(self.tcx, self.typing_env());
             self.layout_of(ty).gcc_type(self)
         };
 
@@ -365,16 +363,28 @@ fn alloc_fields(cx: &CodegenCx<'_, '_>, alloc: &interpret::Allocation) -> Vec<Al
         assert_eq!(offset as usize as u64, offset);
         let offset = offset as usize;
         if offset > next_offset {
-            fields.push(AllocField::Bytes { range: next_offset..offset });
+            push_byte_runs(&mut fields, next_offset..offset);
         }
         fields.push(AllocField::Pointer { offset, prov });
         next_offset = offset + pointer_size;
     }
     if alloc.len() >= next_offset {
-        fields.push(AllocField::Bytes { range: next_offset..alloc.len() });
+        push_byte_runs(&mut fields, next_offset..alloc.len());
     }
 
     fields
+}
+
+/// `gcc_jit_context_new_array_from_bytes` rejects runs of `i32::MAX` bytes or more.
+const MAX_BYTE_RUN_LEN: usize = i32::MAX as usize - 1;
+
+fn push_byte_runs(fields: &mut Vec<AllocField>, range: Range<usize>) {
+    let mut start = range.start;
+    while range.end - start > MAX_BYTE_RUN_LEN {
+        fields.push(AllocField::Bytes { range: start..start + MAX_BYTE_RUN_LEN });
+        start += MAX_BYTE_RUN_LEN;
+    }
+    fields.push(AllocField::Bytes { range: start..range.end });
 }
 
 /// The type [`const_alloc_to_gcc`] gives `alloc`, computed without building any rvalue.
@@ -456,17 +466,6 @@ pub(crate) fn const_alloc_to_gcc_uncached<'gcc>(
 
     // FIXME(bjorn3) avoid wrapping in a struct when there is only a single element.
     cx.const_struct(&llvals, true)
-}
-
-/// Whether this allocation is all zeroes, and so needs no initializer to be spelled out.
-fn is_zero_initializer(alloc: &Allocation) -> bool {
-    alloc.provenance().ptrs().is_empty()
-        // This `inspect` is okay: it is within the bounds of the allocation, there is no provenance
-        // to misread, and it does not affect interpreter execution.
-        && alloc
-            .inspect_with_uninit_and_ptr_outside_interpreter(0..alloc.size().bytes_usize())
-            .iter()
-            .all(|&byte| byte == 0)
 }
 
 fn codegen_static_initializer<'gcc, 'tcx>(

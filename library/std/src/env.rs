@@ -75,7 +75,7 @@ pub fn current_dir() -> io::Result<PathBuf> {
 /// assert!(env::set_current_dir(&root).is_ok());
 /// println!("Successfully changed working directory to {}!", root.display());
 /// ```
-#[doc(alias = "chdir", alias = "SetCurrentDirectory", alias = "SetCurrentDirectoryW")]
+#[doc(alias = "cd", alias = "chdir", alias = "SetCurrentDirectory", alias = "SetCurrentDirectoryW")]
 #[stable(feature = "env", since = "1.0.0")]
 pub fn set_current_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     paths_imp::chdir(path.as_ref())
@@ -132,6 +132,7 @@ impl !Sync for VarsOs {}
 /// [`env::vars_os()`]: vars_os
 #[must_use]
 #[stable(feature = "env", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "env_vars")]
 pub fn vars() -> Vars {
     Vars { inner: vars_os() }
 }
@@ -157,6 +158,7 @@ pub fn vars() -> Vars {
 /// ```
 #[must_use]
 #[stable(feature = "env", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "env_vars_os")]
 pub fn vars_os() -> VarsOs {
     VarsOs { inner: env_imp::env() }
 }
@@ -499,6 +501,57 @@ impl<'a> Iterator for SplitPaths<'a> {
 impl fmt::Debug for SplitPaths<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SplitPaths").finish_non_exhaustive()
+    }
+}
+
+/// An iterator that splits an environment variable into paths according to
+/// platform-specific conventions.
+///
+/// The iterator element type is <code>&[Path]</code>.
+///
+/// This structure is created by [`env::split_paths_ref()`]. See its
+/// documentation for more.
+///
+/// [`env::split_paths_ref()`]: split_paths_ref
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+#[unstable(feature = "env_split_paths_ref", issue = "none")]
+pub struct SplitPathsRef<'a> {
+    inner: paths_imp::SplitPathsRef<'a>,
+}
+
+/// Parses input according to platform conventions for the `PATH`
+/// environment variable.
+///
+/// Unlike [`split_paths`], this function does not allocate and instead yields
+/// [`Path`]s borrowed from `unparsed`. Returns `None` on platforms that may
+/// require allocations to handle `PATH` splitting conventions.
+///
+/// # Platform-specific behavior
+///
+/// Returns `Some` on Unix platforms and `None` on all other platforms.
+/// Note that this [may change in the future][changes].
+///
+/// [changes]: io#platform-specific-behavior
+#[unstable(feature = "env_split_paths_ref", issue = "none")]
+pub fn split_paths_ref<T: AsRef<OsStr> + ?Sized>(unparsed: &T) -> Option<SplitPathsRef<'_>> {
+    Some(SplitPathsRef { inner: paths_imp::split_paths_ref(unparsed.as_ref())? })
+}
+
+#[unstable(feature = "env_split_paths_ref", issue = "none")]
+impl<'a> Iterator for SplitPathsRef<'a> {
+    type Item = &'a Path;
+    fn next(&mut self) -> Option<&'a Path> {
+        self.inner.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+#[unstable(feature = "env_split_paths_ref", issue = "none")]
+impl fmt::Debug for SplitPathsRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SplitPathsRef").finish_non_exhaustive()
     }
 }
 

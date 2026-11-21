@@ -94,6 +94,11 @@ struct SharedOpts {
 
     #[clap(long, global = true)]
     database_path: Option<String>,
+
+    /// Comma-separated list of thread counts for the parallel frontend. Maps directly to the
+    /// `-Zthreads` rustc option. If unspecified, `rustc-perf` uses only 1.
+    #[clap(long, global = true, value_delimiter = ',')]
+    frontend_threads: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
@@ -144,20 +149,33 @@ impl Display for Scenario {
 
 /// Performs profiling using `rustc-perf` on a built version of the compiler.
 pub fn perf(builder: &Builder<'_>, args: &PerfArgs, trailing_args: &[String]) {
-    let collector = builder.ensure(RustcPerf {
-        compiler: builder.compiler(0, builder.config.host_target),
-        target: builder.config.host_target,
-    });
+    let mut cmd = if let Some(ref custom_rustc_perf_path) = builder.rustc_perf_path {
+        builder.info(&format!("using custom rustc_perf at `{}`", custom_rustc_perf_path.display()));
+        let mut cmd = command("cargo");
+        cmd.arg("run");
+        cmd.arg("--release");
+        cmd.args(["--bin", "collector"]);
+        cmd.arg("--");
+        cmd.current_dir(custom_rustc_perf_path);
+        cmd
+    } else {
+        let collector = builder.ensure(RustcPerf {
+            compiler: builder.compiler(0, builder.config.host_target),
+            target: builder.config.host_target,
+        });
+
+        let mut cmd = command(collector.tool_path);
+
+        // We need to set the working directory to `src/tools/rustc-perf`, so that it can find the directory
+        // with compile-time benchmarks.
+        cmd.current_dir(builder.src.join("src/tools/rustc-perf"));
+
+        cmd
+    };
 
     let rustc_perf_dir = builder.sess.tempdir().join("rustc-perf");
     let results_dir = rustc_perf_dir.join("results");
     builder.create_dir(&results_dir);
-
-    let mut cmd = command(collector.tool_path);
-
-    // We need to set the working directory to `src/tools/rustc-perf`, so that it can find the directory
-    // with compile-time benchmarks.
-    cmd.current_dir(builder.src.join("src/tools/rustc-perf"));
 
     let db_path = args
         .cmd
@@ -256,5 +274,9 @@ fn apply_shared_opts(cmd: &mut BootstrapCommand, opts: &SharedOpts) {
     if !opts.scenarios.is_empty() {
         cmd.arg("--scenarios")
             .arg(opts.scenarios.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","));
+    }
+    if !opts.frontend_threads.is_empty() {
+        cmd.arg("--frontend-threads")
+            .arg(opts.frontend_threads.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","));
     }
 }

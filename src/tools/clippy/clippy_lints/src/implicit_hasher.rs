@@ -113,7 +113,7 @@ impl<'tcx> LateLintPass<'tcx> for ImplicitHasher {
                 vis.visit_ty_unambig(impl_.self_ty);
 
                 for target in &vis.found {
-                    if !item.span.eq_ctxt(target.span()) {
+                    if item.span.ctxt() != target.span().ctxt() {
                         return;
                     }
 
@@ -337,7 +337,8 @@ impl<'tcx> Visitor<'tcx> for ImplicitHasherConstructorVisitor<'_, '_, 'tcx> {
 
             match method.ident.name {
                 sym::new => {
-                    self.suggestions.insert(OrdSpan(e.span), format!("{container_name}::default()"));
+                    self.suggestions
+                        .insert(OrdSpan(e.span), format!("{container_name}::default()"));
                 },
                 sym::with_capacity => {
                     let (arg_snippet, _) = snippet_with_context(

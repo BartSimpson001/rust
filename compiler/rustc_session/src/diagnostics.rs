@@ -341,6 +341,16 @@ pub(crate) struct SanitizerCfiRecoverRequiresCfi;
 pub(crate) struct SanitizerCfiDiagRequiresCfi;
 
 #[derive(Diagnostic)]
+#[diag("`-Zsanitizer-cfi-minimal-runtime` requires `-Zsanitizer=cfi`")]
+pub(crate) struct SanitizerCfiMinimalRuntimeRequiresCfi;
+
+#[derive(Diagnostic)]
+#[diag(
+    "`-Zsanitizer-cfi-minimal-runtime` requires `-Zsanitizer-cfi-recover` or `-Zsanitizer-cfi-diag`"
+)]
+pub(crate) struct SanitizerCfiMinimalRuntimeRequiresCfiRecoverOrDiag;
+
+#[derive(Diagnostic)]
 #[diag("`-Zsanitizer-kcfi-arity` requires `-Zsanitizer=kcfi`")]
 pub(crate) struct SanitizerKcfiArityRequiresKcfi;
 
@@ -353,7 +363,7 @@ pub(crate) struct SanitizerKcfiRequiresPanicAbort;
 pub(crate) struct SplitLtoUnitRequiresLto;
 
 #[derive(Diagnostic)]
-#[diag("`-Zvirtual-function-elimination` requires `-Clto`")]
+#[diag("`-Zvirtual-function-elimination` requires `-Clto=fat`")]
 pub(crate) struct UnstableVirtualFunctionElimination;
 
 #[derive(Diagnostic)]
@@ -710,6 +720,10 @@ pub(crate) struct ThinLtoNotSupportedByBackend;
 #[derive(Diagnostic)]
 #[diag("`-Zpacked-stack` is only supported on s390x")]
 pub(crate) struct UnsupportedPackedStack;
+
+#[derive(Diagnostic)]
+#[diag("`-Z pack-coroutine-layout=captures-only` is not yet implemented and will be ignored")]
+pub(crate) struct PackCoroutineLayoutNotImplemented;
 
 #[derive(Diagnostic)]
 #[diag("`-Ctarget-cpu=native` is not allowed for target `{$target_triple}`")]

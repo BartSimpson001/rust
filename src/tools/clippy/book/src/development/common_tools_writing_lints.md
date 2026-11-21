@@ -141,7 +141,7 @@ impl LateLintPass<'_> for MyStructLint {
         }
 
         // 3. If the trait requires additional generic arguments
-        let trait_id = cx.tcx.lang_items().eq_trait();
+        let trait_id = cx.tcx.lang_items().partial_eq_trait();
         if trait_id.is_some_and(|id| implements_trait(cx, ty, id, &[ty])) {
             // `ty` implements `PartialEq<Self>`
         }
@@ -216,7 +216,9 @@ functions to deal with macros:
       return;
   }
   ```
-  > Note: Code that is not from expansion is in the "root" context. So any spans
+
+  > [!NOTE]
+  > Code that is not from expansion is in the "root" context. So any spans
   > where `from_expansion` returns `true` can be assumed to have the same
   > context. And so just using `span.from_expansion()` is often good enough.
 

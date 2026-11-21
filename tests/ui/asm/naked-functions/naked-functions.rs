@@ -1,7 +1,6 @@
 //@ needs-asm-support
 //@ ignore-nvptx64
 //@ ignore-spirv
-//@ reference: attributes.codegen.naked.body
 
 #![feature(asm_unwind, linkage, rustc_attrs, cfg_target_object_format)]
 #![crate_type = "lib"]
@@ -224,7 +223,7 @@ pub extern "C" fn compatible_doc_attributes() {
     naked_asm!("", options(raw));
 }
 
-#[linkage = "external"]
+#[linkage = "weak"]
 #[unsafe(naked)]
 pub extern "C" fn compatible_linkage() {
     naked_asm!("", options(raw));
@@ -248,3 +247,7 @@ pub extern "C" fn rustfmt_skip() {
 unsafe extern "custom" fn abi_custom() {
     naked_asm!("")
 }
+
+//@ reference: asm.operand-type.naked_asm-restriction
+//@ reference: asm.options.naked_asm-restriction
+//@ reference: attributes.codegen.naked.body
